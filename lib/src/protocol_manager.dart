@@ -63,6 +63,12 @@ final class ProtocolManager {
       throw StateError("Bluetooth sender should not be connected at the start");
     }
 
+    // this can be considered to belong to the protocol
+    // ignore: invalid_use_of_protected_member
+    run.displayState.emit(
+      run.displayState.withChanges(null, .initializing, null),
+    );
+
     final nfcReceiverAvailable = await Future.value(
       run.nfcReceiverState.isAvailable(),
     );
@@ -548,7 +554,9 @@ final class ProtocolManager {
               );
             }
             try {
-              await run.bluetoothSenderState.connect(activeSessionId);
+              if (!(await run.bluetoothSenderState.connect(activeSessionId))) {
+                throw Exception();
+              }
             } catch (_) {
               // this can be considered to belong to the protocol
               // ignore: invalid_use_of_protected_member
@@ -941,6 +949,9 @@ final class DisplayEvent extends Event<DisplayState> {
 }
 
 enum DisplayContactMode {
+  /// App should display that the protocol is currently initializing.
+  initializing,
+
   /// App should display the need to tap the other device to the user's.
   tapOther,
 

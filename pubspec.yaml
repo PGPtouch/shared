@@ -1,0 +1,17 @@
+name: shared
+description: A collection of code shared between different client implementations of the PGPtouch protocol in Dart.
+publish_to: none
+
+environment:
+  sdk: ^3.13.1
+
+dependencies:
+  meta: ^1.19.0
+  collection: ^1.19.1
+  cryptography: ^2.9.0
+  uuid: ^4.6.0
+  dart_pg: ^2.1.0
+
+dev_dependencies:
+  lints: ^6.0.0
+  test: ^1.25.6

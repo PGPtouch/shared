@@ -63,6 +63,18 @@ final class ProtocolManager {
       throw StateError("Bluetooth sender should not be connected at the start");
     }
 
+    final nfcReceiverAvailable = await Future.value(
+      run.nfcReceiverState.isAvailable(),
+    );
+    final bluetoothSenderAvailable = await Future.value(
+      run.bluetoothSenderState.isAvailable(),
+    );
+    if (!nfcReceiverAvailable) {
+      throw StateError("NFC receiver must be available at the start");
+    } else if (!bluetoothSenderAvailable) {
+      throw StateError("Bluetooth must be available at the start");
+    }
+
     final rawPrivateKey = PrivateKey(PacketList.decode(pgpPrivateKey));
     if (rawPrivateKey.isEncrypted && privateKeyPassphrase == null) {
       throw ArgumentError.value(
@@ -90,12 +102,12 @@ final class ProtocolManager {
     final ephemeralKeyPair = await x25519.newKeyPair();
     final ephemeralPublicKey = await ephemeralKeyPair.extractPublicKey();
 
-    final nfcSenderSupported = await Future.value(
-      run.nfcSenderState.isSupported(),
+    final nfcSenderAvailable = await Future.value(
+      run.nfcSenderState.isAvailable(),
     );
     final capabilities = Capabilities(
-      nfc: true,
-      bluetooth: true,
+      nfc: nfcReceiverAvailable,
+      bluetooth: bluetoothSenderAvailable,
       uwb:
           false, // TODO: cf. 1.3, PGPtouch definition; UWB is not yet specified
     ).toMap();
@@ -159,7 +171,7 @@ final class ProtocolManager {
     try {
       await (run.bluetoothReceiverState..data = sessionId.toFormattedString())
           .start();
-      if (nfcSenderSupported) {
+      if (nfcSenderAvailable) {
         await (run.nfcSenderState
               ..data = NfcBootstrap(
                 random: random,
@@ -578,7 +590,7 @@ final class ProtocolManager {
               );
             }
 
-            if (nfcSenderSupported) {
+            if (nfcSenderAvailable) {
               if (random > payload.random) {
                 // cf. 1.1.3, PGPtouch definition
                 continue;
@@ -1056,15 +1068,16 @@ abstract base class NfcSenderState
     extends CommonState<NfcSenderState, NfcSenderEvent>
     with
         StartableCommonState<NfcSenderState, NfcSenderEvent>,
-        CommonStateWithData<NfcSenderState, NfcSenderEvent, NfcBootstrap> {
-  FutureOr<bool> isSupported();
-}
+        CommonStateWithData<NfcSenderState, NfcSenderEvent, NfcBootstrap>,
+        CommonStateWithAvailabilityCheck<NfcSenderState, NfcSenderEvent> {}
 
 final class NfcSenderEvent extends Event<NfcSenderState> {}
 
 abstract base class NfcReceiverState
     extends CommonState<NfcReceiverState, NfcReceiverEvent>
-    with StartableCommonState<NfcReceiverState, NfcReceiverEvent> {}
+    with
+        StartableCommonState<NfcReceiverState, NfcReceiverEvent>,
+        CommonStateWithAvailabilityCheck<NfcReceiverState, NfcReceiverEvent> {}
 
 final class NfcReceiverEvent extends Event<NfcReceiverState> {
   final Uint8List? received;
@@ -1072,12 +1085,24 @@ final class NfcReceiverEvent extends Event<NfcReceiverState> {
 }
 
 abstract base class BluetoothSenderState
-    extends CommonState<BluetoothSenderState, BluetoothSenderEvent> {
+    extends CommonState<BluetoothSenderState, BluetoothSenderEvent>
+    with
+        CommonStateWithAvailabilityCheck<
+          BluetoothSenderState,
+          BluetoothSenderEvent
+        > {
   Future<bool> connect(String sessionId);
   Future<void> disconnect();
   Future<bool> isConnected();
 
   Future<void> send(Uint8List data);
+
+  /// Checks whether Bluetooth is currently available.
+  ///
+  /// If this returns `true`, both [BluetoothSenderState] and
+  /// [BluetoothReceiverState] are assumed to be available.
+  @override
+  FutureOr<bool> isAvailable();
 
   final _pageBuffer = <int, List<Payload?>>{};
   final _responseCompleters = <int, Completer<Uint8List>>{};

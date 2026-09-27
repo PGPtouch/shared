@@ -11,7 +11,7 @@ final class NfcSender extends NfcSenderState {
   NfcSender({this.pairedReceiver});
 
   @override
-  bool isSupported() => true;
+  bool isAvailable() => true;
 
   @override
   Future<void> start() async {
@@ -40,6 +40,9 @@ final class NfcSender extends NfcSenderState {
 }
 
 final class NfcReceiver extends NfcReceiverState {
+  @override
+  bool isAvailable() => true;
+
   @override
   Future<void> start() async {}
 
@@ -77,6 +80,9 @@ final class BluetoothSender extends BluetoothSenderState {
     }
     await receiver.simulateWriteRequest(data, notificationHandler);
   }
+
+  @override
+  bool isAvailable() => true;
 }
 
 final class BluetoothReceiver extends BluetoothReceiverState {

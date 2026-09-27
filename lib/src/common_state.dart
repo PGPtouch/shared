@@ -27,6 +27,7 @@ abstract base class CommonState<
 
 base mixin StartableCommonState<S extends CommonState<S, E>, E extends Event<S>>
     implements CommonState<S, E> {
+  /// Starts the state, performing any necessary initialization.
   Future<void> start();
 }
 
@@ -37,10 +38,21 @@ base mixin CommonStateWithData<
 >
     implements CommonState<S, E> {
   D? _data;
+
+  /// The data associated with this state.
   D? get data => _data;
   set data(D? d) {
     _data = d;
   }
+}
+
+base mixin CommonStateWithAvailabilityCheck<
+  S extends CommonState<S, E>,
+  E extends Event<S>
+>
+    implements CommonState<S, E> {
+  /// Check whether the feature is available.
+  FutureOr<bool> isAvailable();
 }
 
 abstract class Event<S extends CommonState<S, Event<S>>> {}

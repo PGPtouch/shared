@@ -175,7 +175,7 @@ final class ProtocolManager {
     }
 
     try {
-      await (() async {
+      Future<void> runtime() async {
         await (run.bluetoothReceiverState..data = sessionId.toFormattedString())
             .start();
         if (nfcSenderAvailable) {
@@ -847,27 +847,31 @@ final class ProtocolManager {
           await bluetoothReceiver.future.catchError(Error.throwWithStackTrace);
           // behavior defined above
         }
-      })().timeout(
-        const Duration(seconds: 30),
-        onTimeout: () {
-          // this can be considered to belong to the protocol
-          // ignore: invalid_use_of_protected_member
-          run.displayState.emit(
-            run.displayState.withChanges(
-              null,
-              .done,
-              DisplayResult(
-                mode: .failure,
-                errorMode: null,
-                failureMode: .connectionFailed,
-              ),
-            ),
+      }
+
+      await runtime()
+          .catchError(Error.throwWithStackTrace)
+          .timeout(
+            const Duration(seconds: 30),
+            onTimeout: () {
+              // this can be considered to belong to the protocol
+              // ignore: invalid_use_of_protected_member
+              run.displayState.emit(
+                run.displayState.withChanges(
+                  null,
+                  .done,
+                  DisplayResult(
+                    mode: .failure,
+                    errorMode: null,
+                    failureMode: .connectionFailed,
+                  ),
+                ),
+              );
+              throw _ProtocolBreakException(
+                "Protocol run timed out after 30 seconds.",
+              );
+            },
           );
-          throw _ProtocolBreakException(
-            "Protocol run timed out after 30 seconds.",
-          );
-        },
-      );
     } on _ProtocolBreakException catch (_) {
       // The error should've been handled by a previous DisplayState update
     } finally {

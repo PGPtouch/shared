@@ -175,164 +175,73 @@ final class ProtocolManager {
     }
 
     try {
-      await (run.bluetoothReceiverState..data = sessionId.toFormattedString())
-          .start();
-      if (nfcSenderAvailable) {
-        await (run.nfcSenderState
-              ..data = NfcBootstrap(
-                random: random,
-                sessionId: sessionId.toBytes(validate: true),
-                capabilities: capabilities,
-                nonce: nonce,
-                publicX25519Key: Uint8List.fromList(ephemeralPublicKey.bytes),
-              ))
+      await (() async {
+        await (run.bluetoothReceiverState..data = sessionId.toFormattedString())
             .start();
-      }
-      await run.nfcReceiverState.start();
-
-      final roleCompleter = Completer();
-      final roleBluetoothReceiverCompleter = Completer<ProtocolRole>();
-      final bluetoothReceiver = Completer<void>();
-
-      run.bluetoothReceiverState._registerReadRequestHandler((
-        data,
-        sendResponseWriteRequest,
-      ) async {
-        if (roleCompleter.isCompleted) {
-          // just exit the loop if the role has already been determined
-          run.bluetoothReceiverState._unregisterReadRequestHandler();
-          if (roleBluetoothReceiverCompleter.isCompleted) return;
-          roleBluetoothReceiverCompleter.complete(ProtocolRole.serverSender);
-          return;
+        if (nfcSenderAvailable) {
+          await (run.nfcSenderState
+                ..data = NfcBootstrap(
+                  random: random,
+                  sessionId: sessionId.toBytes(validate: true),
+                  capabilities: capabilities,
+                  nonce: nonce,
+                  publicX25519Key: Uint8List.fromList(ephemeralPublicKey.bytes),
+                ))
+              .start();
         }
-        late final HandshakePayload event;
-        try {
-          final tmpEvent = Payload.fromBytes(data);
-          if (tmpEvent is ErrorReportPayload) {
-            // this can be considered to belong to the protocol
-            // ignore: invalid_use_of_protected_member
-            run.displayState.emit(
-              run.displayState.withChanges(
-                null,
-                .done,
-                DisplayResult(
-                  mode: .error,
-                  errorMode: DisplayErrorMode.fromInt(tmpEvent.errorCode.value),
-                  failureMode: null,
-                ),
-              ),
-            );
-            roleBluetoothReceiverCompleter.completeError(
-              _ProtocolBreakException(
-                "Bluetooth negotiation failed due to error report.",
-              ),
-            );
-            return;
-          } else if (tmpEvent is HandshakePayload) {
-            event = tmpEvent;
-          } else {
-            throw Exception();
-          }
-        } catch (_) {
-          if (data.length >= 7) {
-            final tmpRequestId = data.sublist(4, 7);
-            if (tmpRequestId.toIntOrNull() != null) {
-              await sendResponseWriteRequest(
-                ErrorReportPayload(
-                  requestId: tmpRequestId,
-                  appErrorCode: _defaultAppErrorCode,
-                  errorCode: .error.unableToReadContent,
-                ).toBytes(),
-              );
-            }
-          }
-          // this can be considered to belong to the protocol
-          // ignore: invalid_use_of_protected_member
-          run.displayState.emit(
-            run.displayState.withChanges(
-              null,
-              .done,
-              DisplayResult(
-                mode: .failure,
-                errorMode: null,
-                failureMode: .misformattedMessage,
-              ),
-            ),
-          );
-          roleBluetoothReceiverCompleter.completeError(
-            _ProtocolBreakException(
-              "Bluetooth negotiation failed due to unreadable content.",
-            ),
-          );
-          return;
-        }
+        await run.nfcReceiverState.start();
 
-        if (!event.initializerMatchesProtocol()) {
-          await sendResponseWriteRequest(
-            ErrorReportPayload(
-              requestId: event.requestId,
-              appErrorCode: _defaultAppErrorCode,
-              errorCode: .error.headerIncompatible,
-            ).toBytes(),
-          );
-          // this can be considered to belong to the protocol
-          // ignore: invalid_use_of_protected_member
-          run.displayState.emit(
-            run.displayState.withChanges(
-              null,
-              .done,
-              DisplayResult(
-                mode: .failure,
-                errorMode: null,
-                failureMode: .initializerMismatch,
-              ),
-            ),
-          );
-          roleBluetoothReceiverCompleter.completeError(
-            _ProtocolBreakException(
-              "Bluetooth negotiation failed due to initializer mismatch.",
-            ),
-          );
-          return;
-        }
-
-        nonceOther = event.nonce;
-        ephemeralPublicKeyOther = event.publicX25519Key;
-        capabilitiesOther = event.capabilities;
-        await finalizeSharedKeys(false, sessionId.toBytes());
+        final roleCompleter = Completer();
+        final roleBluetoothReceiverCompleter = Completer<ProtocolRole>();
+        final bluetoothReceiver = Completer<void>();
 
         run.bluetoothReceiverState._registerReadRequestHandler((
           data,
           sendResponseWriteRequest,
         ) async {
-          if (bluetoothReceiver.isCompleted) {
+          if (roleCompleter.isCompleted) {
             // just exit the loop if the role has already been determined
             run.bluetoothReceiverState._unregisterReadRequestHandler();
+            if (roleBluetoothReceiverCompleter.isCompleted) return;
+            roleBluetoothReceiverCompleter.complete(ProtocolRole.serverSender);
             return;
           }
-          late Payload event;
+
+          // this can be considered to belong to the protocol
+          // ignore: invalid_use_of_protected_member
+          run.displayState.emit(
+            run.displayState.withChanges(null, .holdOther, null),
+          );
+
+          late final HandshakePayload event;
           try {
-            event = Payload.fromBytes(data);
-            if (event is ErrorReportPayload) {
+            final tmpEvent = Payload.fromBytes(data);
+            if (tmpEvent is ErrorReportPayload) {
               // this can be considered to belong to the protocol
               // ignore: invalid_use_of_protected_member
               run.displayState.emit(
                 run.displayState.withChanges(
-                  run.displayState.lastEvent?.deviceRole.value,
+                  null,
                   .done,
                   DisplayResult(
                     mode: .error,
-                    errorMode: DisplayErrorMode.fromInt(event.errorCode.value),
+                    errorMode: DisplayErrorMode.fromInt(
+                      tmpEvent.errorCode.value,
+                    ),
                     failureMode: null,
                   ),
                 ),
               );
-              bluetoothReceiver.completeError(
+              roleBluetoothReceiverCompleter.completeError(
                 _ProtocolBreakException(
                   "Bluetooth negotiation failed due to error report.",
                 ),
               );
               return;
+            } else if (tmpEvent is HandshakePayload) {
+              event = tmpEvent;
+            } else {
+              throw Exception();
             }
           } catch (_) {
             if (data.length >= 7) {
@@ -351,7 +260,7 @@ final class ProtocolManager {
             // ignore: invalid_use_of_protected_member
             run.displayState.emit(
               run.displayState.withChanges(
-                run.displayState.lastEvent?.deviceRole.value,
+                null,
                 .done,
                 DisplayResult(
                   mode: .failure,
@@ -360,7 +269,7 @@ final class ProtocolManager {
                 ),
               ),
             );
-            bluetoothReceiver.completeError(
+            roleBluetoothReceiverCompleter.completeError(
               _ProtocolBreakException(
                 "Bluetooth negotiation failed due to unreadable content.",
               ),
@@ -368,52 +277,53 @@ final class ProtocolManager {
             return;
           }
 
-          // MARK: Server Runtime
-          switch (event.runtimeType) {
-            case KeyExchangePayload:
-              final keyExchangePayload = event as KeyExchangePayload;
-              pgpPublicKeyOther = await decrypt(
-                keyExchangePayload.publicPgpKey,
-              );
-              await executeForPagesOfContent(
-                await encrypt(pgpPublicKey),
-                (page, pageIndex, pageCount) => sendResponseWriteRequest(
-                  KeyExchangePayload(
-                    requestId: keyExchangePayload.requestId,
-                    publicPgpKey: page,
-                    pageIndex: pageIndex,
-                    pages: pageCount,
-                  ).toBytes(),
+          if (!event.initializerMatchesProtocol()) {
+            await sendResponseWriteRequest(
+              ErrorReportPayload(
+                requestId: event.requestId,
+                appErrorCode: _defaultAppErrorCode,
+                errorCode: .error.headerIncompatible,
+              ).toBytes(),
+            );
+            // this can be considered to belong to the protocol
+            // ignore: invalid_use_of_protected_member
+            run.displayState.emit(
+              run.displayState.withChanges(
+                null,
+                .done,
+                DisplayResult(
+                  mode: .failure,
+                  errorMode: null,
+                  failureMode: .initializerMismatch,
                 ),
-              );
-            case SignatureExchangePayload:
-              final signatureExchangePayload =
-                  event as SignatureExchangePayload;
-              final signatureOther = await decrypt(
-                signatureExchangePayload.detachedSignature,
-              );
+              ),
+            );
+            roleBluetoothReceiverCompleter.completeError(
+              _ProtocolBreakException(
+                "Bluetooth negotiation failed due to initializer mismatch.",
+              ),
+            );
+            return;
+          }
 
-              final fingerprintA = _primaryPublicKeyPacket(pgpPublicKey);
-              final fingerprintB = _primaryPublicKeyPacket(pgpPublicKeyOther!);
-              final transcript = _formatTranscript(
-                sessionId: activeSessionId,
-                nonceA: base64Encode(nonce),
-                nonceB: base64Encode(nonceOther!),
-                ephemeralA: base64Encode(ephemeralPublicKey.bytes),
-                ephemeralB: base64Encode(ephemeralPublicKeyOther!),
-                fingerprintA: base64Encode(fingerprintA.fingerprint),
-                fingerprintB: base64Encode(fingerprintB.fingerprint),
-                capabilitiesA: Capabilities.fromMap(capabilities).toInt(),
-                capabilitiesB: Capabilities.fromMap(capabilitiesOther!).toInt(),
-                uwb: null, // TODO: cf. 1.3, PGPtouch definition; UWB is not yet specified
-              );
+          nonceOther = event.nonce;
+          ephemeralPublicKeyOther = event.publicX25519Key;
+          capabilitiesOther = event.capabilities;
+          await finalizeSharedKeys(false, sessionId.toBytes());
 
-              late final Uint8List signature;
-              try {
-                signature = OpenPGP.signDetachedCleartext(transcript, [
-                  privateKey,
-                ]).packetList.encode();
-              } catch (_) {
+          run.bluetoothReceiverState._registerReadRequestHandler((
+            data,
+            sendResponseWriteRequest,
+          ) async {
+            if (bluetoothReceiver.isCompleted) {
+              // just exit the loop if the role has already been determined
+              run.bluetoothReceiverState._unregisterReadRequestHandler();
+              return;
+            }
+            late Payload event;
+            try {
+              event = Payload.fromBytes(data);
+              if (event is ErrorReportPayload) {
                 // this can be considered to belong to the protocol
                 // ignore: invalid_use_of_protected_member
                 run.displayState.emit(
@@ -421,127 +331,39 @@ final class ProtocolManager {
                     run.displayState.lastEvent?.deviceRole.value,
                     .done,
                     DisplayResult(
-                      mode: .failure,
-                      errorMode: null,
-                      failureMode: .suppliedSignatureFailed,
+                      mode: .error,
+                      errorMode: DisplayErrorMode.fromInt(
+                        event.errorCode.value,
+                      ),
+                      failureMode: null,
                     ),
                   ),
                 );
                 bluetoothReceiver.completeError(
-                  _ProtocolBreakException("Supplied signature failed"),
-                );
-                return;
-              }
-
-              await executeForPagesOfContent(
-                await encrypt(signature),
-                (page, pageIndex, pageCount) => sendResponseWriteRequest(
-                  SignatureExchangePayload(
-                    requestId: signatureExchangePayload.requestId,
-                    detachedSignature: page,
-                    pageIndex: pageIndex,
-                    pages: pageCount,
-                  ).toBytes(),
-                ),
-              );
-
-              final verification = CleartextMessage(transcript).verifyDetached(
-                [PublicKey(PacketList.decode(pgpPublicKeyOther!))],
-                Signature(
-                  PacketList.decode(signatureOther).packets
-                      .whereType<SignaturePacket>(),
-                ),
-              ).first;
-              if (!verification.isVerified) {
-                // this can be considered to belong to the protocol
-                // ignore: invalid_use_of_protected_member
-                run.displayState.emit(
-                  run.displayState.withChanges(
-                    run.displayState.lastEvent?.deviceRole.value,
-                    .done,
-                    DisplayResult(
-                      mode: .failure,
-                      errorMode: null,
-                      failureMode: .signatureVerificationFailed,
-                      additionalInfo: verification.verificationError,
-                    ),
+                  _ProtocolBreakException(
+                    "Bluetooth negotiation failed due to error report.",
                   ),
                 );
-                bluetoothReceiver.completeError(
-                  _ProtocolBreakException("Signature verification failed"),
-                );
                 return;
               }
-
+            } catch (_) {
+              if (data.length >= 7) {
+                final tmpRequestId = data.sublist(4, 7);
+                if (tmpRequestId.toIntOrNull() != null) {
+                  await sendResponseWriteRequest(
+                    ErrorReportPayload(
+                      requestId: tmpRequestId,
+                      appErrorCode: _defaultAppErrorCode,
+                      errorCode: .error.unableToReadContent,
+                    ).toBytes(),
+                  );
+                }
+              }
               // this can be considered to belong to the protocol
               // ignore: invalid_use_of_protected_member
               run.displayState.emit(
                 run.displayState.withChanges(
                   run.displayState.lastEvent?.deviceRole.value,
-                  .done,
-                  DisplayResult(
-                    mode: .success,
-                    errorMode: null,
-                    failureMode: null,
-                    additionalInfo: (
-                      fingerprint: _primaryPublicKeyPacket(pgpPublicKeyOther!)
-                          .fingerprint,
-                      pgpKey: pgpPublicKeyOther!,
-                      userIds: verification.userIDs.toSet(),
-                    ),
-                  ),
-                ),
-              );
-              if (!bluetoothReceiver.isCompleted) bluetoothReceiver.complete();
-          }
-        });
-
-        await sendResponseWriteRequest(
-          HandshakePayload(
-            requestId: event.requestId,
-            capabilities: capabilities,
-            nonce: Uint8List.fromList(List.filled(32, 0)),
-            publicX25519Key: Uint8List.fromList(List.filled(32, 0)),
-          ).toBytes(),
-        );
-
-        // TODO: cf. 1.3, PGPtouch definition; UWB is not yet specified
-
-        activeSessionId = sessionId.toFormattedString();
-        roleCompleter.complete();
-        roleBluetoothReceiverCompleter.complete(ProtocolRole.serverSender);
-      });
-
-      final role = await Future.any<ProtocolRole>([
-        roleBluetoothReceiverCompleter.future,
-        () async {
-          while (true) {
-            late final NfcReceiverEvent event;
-            try {
-              event = await run.nfcReceiverState.events.first;
-              if (event.received == null) continue;
-            } catch (_) {}
-            if (roleCompleter.isCompleted) {
-              // just exit the loop if the role has already been determined
-              return ProtocolRole.clientReceiver;
-            }
-
-            late final NfcBootstrap payload;
-            try {
-              payload = NfcBootstrap.fromBytes(event.received!);
-            } catch (_) {
-              continue;
-            }
-
-            try {
-              activeSessionId = UuidValue.fromByteList(payload.sessionId)
-                  .toFormattedString();
-            } catch (_) {
-              // this can be considered to belong to the protocol
-              // ignore: invalid_use_of_protected_member
-              run.displayState.emit(
-                run.displayState.withChanges(
-                  null,
                   .done,
                   DisplayResult(
                     mode: .failure,
@@ -550,61 +372,146 @@ final class ProtocolManager {
                   ),
                 ),
               );
-              throw _ProtocolBreakException(
-                "NFC negotiation failed due to invalid session ID.",
-              );
-            }
-            try {
-              if (!(await run.bluetoothSenderState.connect(activeSessionId))) {
-                throw Exception();
-              }
-            } catch (_) {
-              // this can be considered to belong to the protocol
-              // ignore: invalid_use_of_protected_member
-              run.displayState.emit(
-                run.displayState.withChanges(
-                  null,
-                  .done,
-                  DisplayResult(
-                    mode: .failure,
-                    errorMode: null,
-                    failureMode: .connectionFailed,
-                  ),
+              bluetoothReceiver.completeError(
+                _ProtocolBreakException(
+                  "Bluetooth negotiation failed due to unreadable content.",
                 ),
               );
-              throw _ProtocolBreakException(
-                "NFC negotiation failed due to connection failure.",
-              );
-            }
-            if (!payload.initializerMatchesImplementation()) {
-              // this can be considered to belong to the protocol
-              // ignore: invalid_use_of_protected_member
-              run.displayState.emit(
-                run.displayState.withChanges(
-                  null,
-                  .done,
-                  DisplayResult(
-                    mode: .failure,
-                    errorMode: null,
-                    failureMode: .initializerMismatch,
-                    additionalInfo: (
-                      expected: protocolInitializerDefaults.version,
-                      received: payload.protocolInitializerVersion,
-                    ),
-                  ),
-                ),
-              );
-              throw _ProtocolBreakException(
-                "NFC negotiation failed due to protocol initializer mismatch.",
-              );
+              return;
             }
 
-            if (nfcSenderAvailable) {
-              if (random > payload.random) {
-                // cf. 1.1.3, PGPtouch definition
-                continue;
-              } else if (random == payload.random &&
-                  nonce.toBigInt() > payload.nonce.toBigInt()) {
+            // MARK: Server Runtime
+            switch (event.runtimeType) {
+              case KeyExchangePayload:
+                final keyExchangePayload = event as KeyExchangePayload;
+                pgpPublicKeyOther = await decrypt(
+                  keyExchangePayload.publicPgpKey,
+                );
+                await executeForPagesOfContent(
+                  await encrypt(pgpPublicKey),
+                  (page, pageIndex, pageCount) => sendResponseWriteRequest(
+                    KeyExchangePayload(
+                      requestId: keyExchangePayload.requestId,
+                      publicPgpKey: page,
+                      pageIndex: pageIndex,
+                      pages: pageCount,
+                    ).toBytes(),
+                  ),
+                );
+              case SignatureExchangePayload:
+                final signatureExchangePayload =
+                    event as SignatureExchangePayload;
+                final signatureOther = await decrypt(
+                  signatureExchangePayload.detachedSignature,
+                );
+
+                final fingerprintA = _primaryPublicKeyPacket(pgpPublicKey);
+                final fingerprintB = _primaryPublicKeyPacket(
+                  pgpPublicKeyOther!,
+                );
+                final transcript = _formatTranscript(
+                  sessionId: activeSessionId,
+                  nonceA: base64Encode(nonce),
+                  nonceB: base64Encode(nonceOther!),
+                  ephemeralA: base64Encode(ephemeralPublicKey.bytes),
+                  ephemeralB: base64Encode(ephemeralPublicKeyOther!),
+                  fingerprintA: base64Encode(fingerprintA.fingerprint),
+                  fingerprintB: base64Encode(fingerprintB.fingerprint),
+                  capabilitiesA: Capabilities.fromMap(capabilities).toInt(),
+                  capabilitiesB: Capabilities.fromMap(capabilitiesOther!)
+                      .toInt(),
+                  uwb: null, // TODO: cf. 1.3, PGPtouch definition; UWB is not yet specified
+                );
+
+                late final Uint8List signature;
+                try {
+                  signature = OpenPGP.signDetachedCleartext(transcript, [
+                    privateKey,
+                  ]).packetList.encode();
+                } catch (_) {
+                  // this can be considered to belong to the protocol
+                  // ignore: invalid_use_of_protected_member
+                  run.displayState.emit(
+                    run.displayState.withChanges(
+                      run.displayState.lastEvent?.deviceRole.value,
+                      .done,
+                      DisplayResult(
+                        mode: .failure,
+                        errorMode: null,
+                        failureMode: .suppliedKeysFailed,
+                      ),
+                    ),
+                  );
+                  bluetoothReceiver.completeError(
+                    _ProtocolBreakException("Supplied signature failed"),
+                  );
+                  return;
+                }
+
+                await executeForPagesOfContent(
+                  await encrypt(signature),
+                  (page, pageIndex, pageCount) => sendResponseWriteRequest(
+                    SignatureExchangePayload(
+                      requestId: signatureExchangePayload.requestId,
+                      detachedSignature: page,
+                      pageIndex: pageIndex,
+                      pages: pageCount,
+                    ).toBytes(),
+                  ),
+                );
+
+                final verification = CleartextMessage(transcript)
+                    .verifyDetached(
+                      [PublicKey(PacketList.decode(pgpPublicKeyOther!))],
+                      Signature(
+                        PacketList.decode(signatureOther).packets
+                            .whereType<SignaturePacket>(),
+                      ),
+                    )
+                    .first;
+                if (!verification.isVerified) {
+                  // this can be considered to belong to the protocol
+                  // ignore: invalid_use_of_protected_member
+                  run.displayState.emit(
+                    run.displayState.withChanges(
+                      run.displayState.lastEvent?.deviceRole.value,
+                      .done,
+                      DisplayResult(
+                        mode: .failure,
+                        errorMode: null,
+                        failureMode: .signatureVerificationFailed,
+                        additionalInfo: verification.verificationError,
+                      ),
+                    ),
+                  );
+                  bluetoothReceiver.completeError(
+                    _ProtocolBreakException("Signature verification failed"),
+                  );
+                  return;
+                }
+
+                // this can be considered to belong to the protocol
+                // ignore: invalid_use_of_protected_member
+                run.displayState.emit(
+                  run.displayState.withChanges(
+                    run.displayState.lastEvent?.deviceRole.value,
+                    .done,
+                    DisplayResult(
+                      mode: .success,
+                      errorMode: null,
+                      failureMode: null,
+                      additionalInfo: (
+                        fingerprint: _primaryPublicKeyPacket(pgpPublicKeyOther!)
+                            .fingerprint,
+                        pgpKey: pgpPublicKeyOther!,
+                        userIds: verification.userIDs.toSet(),
+                      ),
+                    ),
+                  ),
+                );
+                if (!bluetoothReceiver.isCompleted)
+                  bluetoothReceiver.complete();
+              default:
                 // this can be considered to belong to the protocol
                 // ignore: invalid_use_of_protected_member
                 run.displayState.emit(
@@ -614,199 +521,353 @@ final class ProtocolManager {
                     DisplayResult(
                       mode: .failure,
                       errorMode: null,
-                      failureMode: .pureLuck,
+                      failureMode: .misformattedMessage,
+                    ),
+                  ),
+                );
+            }
+          });
+
+          await sendResponseWriteRequest(
+            HandshakePayload(
+              requestId: event.requestId,
+              capabilities: capabilities,
+              nonce: Uint8List.fromList(List.filled(32, 0)),
+              publicX25519Key: Uint8List.fromList(List.filled(32, 0)),
+            ).toBytes(),
+          );
+
+          // TODO: cf. 1.3, PGPtouch definition; UWB is not yet specified
+
+          activeSessionId = sessionId.toFormattedString();
+          roleCompleter.complete();
+          roleBluetoothReceiverCompleter.complete(ProtocolRole.serverSender);
+        });
+
+        final role = await Future.any<ProtocolRole>([
+          roleBluetoothReceiverCompleter.future,
+          () async {
+            while (true) {
+              late final NfcReceiverEvent event;
+              try {
+                event = await run.nfcReceiverState.events.first;
+                if (event.received == null) continue;
+              } catch (_) {}
+              if (roleCompleter.isCompleted) {
+                // just exit the loop if the role has already been determined
+                return ProtocolRole.clientReceiver;
+              }
+
+              // this can be considered to belong to the protocol
+              // ignore: invalid_use_of_protected_member
+              run.displayState.emit(
+                run.displayState.withChanges(null, .holdOther, null),
+              );
+
+              late final NfcBootstrap payload;
+              try {
+                payload = NfcBootstrap.fromBytes(event.received!);
+              } catch (_) {
+                continue;
+              }
+
+              try {
+                activeSessionId = UuidValue.fromByteList(payload.sessionId)
+                    .toFormattedString();
+              } catch (_) {
+                // this can be considered to belong to the protocol
+                // ignore: invalid_use_of_protected_member
+                run.displayState.emit(
+                  run.displayState.withChanges(
+                    null,
+                    .done,
+                    DisplayResult(
+                      mode: .failure,
+                      errorMode: null,
+                      failureMode: .misformattedMessage,
                     ),
                   ),
                 );
                 throw _ProtocolBreakException(
-                  "NFC negotiation failed due to random/nonce comparison. "
-                  "(Chances for this are 2^-264; extremely unlikely)",
+                  "NFC negotiation failed due to invalid session ID.",
                 );
               }
+              try {
+                if (!(await run.bluetoothSenderState.connect(
+                  activeSessionId,
+                ))) {
+                  throw Exception();
+                }
+              } catch (_) {
+                // this can be considered to belong to the protocol
+                // ignore: invalid_use_of_protected_member
+                run.displayState.emit(
+                  run.displayState.withChanges(
+                    null,
+                    .done,
+                    DisplayResult(
+                      mode: .failure,
+                      errorMode: null,
+                      failureMode: .connectionFailed,
+                    ),
+                  ),
+                );
+                throw _ProtocolBreakException(
+                  "NFC negotiation failed due to connection failure.",
+                );
+              }
+              if (!payload.initializerMatchesImplementation()) {
+                // this can be considered to belong to the protocol
+                // ignore: invalid_use_of_protected_member
+                run.displayState.emit(
+                  run.displayState.withChanges(
+                    null,
+                    .done,
+                    DisplayResult(
+                      mode: .failure,
+                      errorMode: null,
+                      failureMode: .initializerMismatch,
+                      additionalInfo: (
+                        expected: protocolInitializerDefaults.version,
+                        received: payload.protocolInitializerVersion,
+                      ),
+                    ),
+                  ),
+                );
+                throw _ProtocolBreakException(
+                  "NFC negotiation failed due to protocol initializer mismatch.",
+                );
+              }
+
+              if (nfcSenderAvailable) {
+                if (random > payload.random) {
+                  // cf. 1.1.3, PGPtouch definition
+                  continue;
+                } else if (random == payload.random &&
+                    nonce.toBigInt() > payload.nonce.toBigInt()) {
+                  // this can be considered to belong to the protocol
+                  // ignore: invalid_use_of_protected_member
+                  run.displayState.emit(
+                    run.displayState.withChanges(
+                      null,
+                      .done,
+                      DisplayResult(
+                        mode: .failure,
+                        errorMode: null,
+                        failureMode: .pureLuck,
+                      ),
+                    ),
+                  );
+                  throw _ProtocolBreakException(
+                    "NFC negotiation failed due to random/nonce comparison. "
+                    "(Chances for this are 2^-264; extremely unlikely)",
+                  );
+                }
+              }
+
+              nonceOther = payload.nonce;
+              ephemeralPublicKeyOther = payload.publicX25519Key;
+              capabilitiesOther = payload.capabilities;
+              await finalizeSharedKeys(true, payload.sessionId);
+
+              if (!roleCompleter.isCompleted) roleCompleter.complete();
+              return ProtocolRole.clientReceiver;
             }
-
-            nonceOther = payload.nonce;
-            ephemeralPublicKeyOther = payload.publicX25519Key;
-            capabilitiesOther = payload.capabilities;
-            await finalizeSharedKeys(true, payload.sessionId);
-
-            if (!roleCompleter.isCompleted) roleCompleter.complete();
-            return ProtocolRole.clientReceiver;
-          }
-        }(),
-      ]).catchError(Error.throwWithStackTrace);
-
-      // this can be considered to belong to the protocol
-      // ignore: invalid_use_of_protected_member
-      run.displayState.emit(
-        run.displayState.withChanges(role, .holdOther, null),
-      );
-
-      run.nfcSenderState.dispose();
-      run.nfcReceiverState.dispose();
-      if (role == ProtocolRole.clientReceiver) {
-        // MARK: Client Runtime
-        bluetoothReceiver.complete();
-        run.bluetoothReceiverState.dispose();
-
-        await run.bluetoothSenderState.send(
-          HandshakePayload(
-            requestId: rng.nextByte(3),
-            capabilities: capabilities,
-            nonce: nonce,
-            publicX25519Key: Uint8List.fromList(ephemeralPublicKey.bytes),
-          ).toBytes(),
-        );
-
-        final keyExchangeRequestId = rng.nextByte(3);
-        await executeForPagesOfContent(
-          await encrypt(pgpPublicKey),
-          (page, pageIndex, pageCount) async =>
-              await run.bluetoothSenderState.send(
-                KeyExchangePayload(
-                  requestId: keyExchangeRequestId,
-                  publicPgpKey: page,
-                  pageIndex: pageIndex,
-                  pages: pageCount,
-                ).toBytes(),
-              ),
-        );
-        late final KeyExchangePayload keyExchangeResponse;
-        try {
-          keyExchangeResponse = Payload.fromBytes(
-            await run.bluetoothSenderState.receiveRequestIdResponse(
-              keyExchangeRequestId.toInt(),
-            ),
-          ) as KeyExchangePayload;
-        } catch (_) {
-          // this can be considered to belong to the protocol
-          // ignore: invalid_use_of_protected_member
-          run.displayState.emit(
-            run.displayState.withChanges(
-              role,
-              .done,
-              DisplayResult(
-                mode: .failure,
-                errorMode: null,
-                failureMode: .misformattedMessage,
-              ),
-            ),
-          );
-          throw _ProtocolBreakException(
-            "Bluetooth key exchange failed due to misformatted message.",
-          );
-        }
-        pgpPublicKeyOther = await decrypt(keyExchangeResponse.publicPgpKey);
-
-        final fingerprintA = _primaryPublicKeyPacket(pgpPublicKeyOther!);
-        final fingerprintB = _primaryPublicKeyPacket(pgpPublicKey);
-        final transcript = _formatTranscript(
-          sessionId: activeSessionId,
-          nonceA: base64Encode(nonceOther!),
-          nonceB: base64Encode(nonce),
-          ephemeralA: base64Encode(ephemeralPublicKeyOther!),
-          ephemeralB: base64Encode(ephemeralPublicKey.bytes),
-          fingerprintA: base64Encode(fingerprintA.fingerprint),
-          fingerprintB: base64Encode(fingerprintB.fingerprint),
-          capabilitiesA: Capabilities.fromMap(capabilitiesOther!).toInt(),
-          capabilitiesB: Capabilities.fromMap(capabilities).toInt(),
-          uwb: null, // TODO: cf. 1.3, PGPtouch definition; UWB is not yet specified
-        );
-        final signature = OpenPGP.signDetachedCleartext(transcript, [
-          privateKey,
-        ]).packetList.encode();
-
-        final signatureExchangeRequestId = rng.nextByte(3);
-        await executeForPagesOfContent(
-          await encrypt(signature),
-          (page, pageIndex, pageCount) async =>
-              await run.bluetoothSenderState.send(
-                SignatureExchangePayload(
-                  requestId: signatureExchangeRequestId,
-                  detachedSignature: page,
-                  pageIndex: pageIndex,
-                  pages: pageCount,
-                ).toBytes(),
-              ),
-        );
-        late final SignatureExchangePayload signatureExchangeResponse;
-        try {
-          signatureExchangeResponse = Payload.fromBytes(
-            await run.bluetoothSenderState.receiveRequestIdResponse(
-              signatureExchangeRequestId.toInt(),
-            ),
-          ) as SignatureExchangePayload;
-        } catch (_) {
-          // this can be considered to belong to the protocol
-          // ignore: invalid_use_of_protected_member
-          run.displayState.emit(
-            run.displayState.withChanges(
-              role,
-              .done,
-              DisplayResult(
-                mode: .failure,
-                errorMode: null,
-                failureMode: .misformattedMessage,
-              ),
-            ),
-          );
-          throw _ProtocolBreakException(
-            "Bluetooth signature exchange failed due to misformatted message.",
-          );
-        }
-
-        final verification = CleartextMessage(transcript).verifyDetached(
-          [PublicKey(PacketList.decode(pgpPublicKeyOther!))],
-          Signature(
-            PacketList.decode(
-              await decrypt(signatureExchangeResponse.detachedSignature),
-            ).packets.whereType<SignaturePacket>(),
-          ),
-        ).first;
-        if (!verification.isVerified) {
-          // this can be considered to belong to the protocol
-          // ignore: invalid_use_of_protected_member
-          run.displayState.emit(
-            run.displayState.withChanges(
-              role,
-              .done,
-              DisplayResult(
-                mode: .failure,
-                errorMode: null,
-                failureMode: .signatureVerificationFailed,
-                additionalInfo: verification.verificationError,
-              ),
-            ),
-          );
-          throw _ProtocolBreakException(
-            "Bluetooth signature verification failed.",
-          );
-        }
+          }(),
+        ]).catchError(Error.throwWithStackTrace);
 
         // this can be considered to belong to the protocol
         // ignore: invalid_use_of_protected_member
         run.displayState.emit(
-          run.displayState.withChanges(
-            role,
-            .done,
-            DisplayResult(
-              mode: .success,
-              errorMode: null,
-              failureMode: null,
-              additionalInfo: (
-                fingerprint: _primaryPublicKeyPacket(pgpPublicKeyOther!)
-                    .fingerprint,
-                pgpKey: pgpPublicKeyOther!,
-                userIds: verification.userIDs.toSet(),
+          run.displayState.withChanges(role, .holdOther, null),
+        );
+
+        run.nfcSenderState.dispose();
+        run.nfcReceiverState.dispose();
+        if (role == ProtocolRole.clientReceiver) {
+          // MARK: Client Runtime
+          bluetoothReceiver.complete();
+          run.bluetoothReceiverState.dispose();
+
+          await run.bluetoothSenderState.send(
+            HandshakePayload(
+              requestId: rng.nextByte(3),
+              capabilities: capabilities,
+              nonce: nonce,
+              publicX25519Key: Uint8List.fromList(ephemeralPublicKey.bytes),
+            ).toBytes(),
+          );
+
+          final keyExchangeRequestId = rng.nextByte(3);
+          await executeForPagesOfContent(
+            await encrypt(pgpPublicKey),
+            (page, pageIndex, pageCount) async =>
+                await run.bluetoothSenderState.send(
+                  KeyExchangePayload(
+                    requestId: keyExchangeRequestId,
+                    publicPgpKey: page,
+                    pageIndex: pageIndex,
+                    pages: pageCount,
+                  ).toBytes(),
+                ),
+          );
+          late final KeyExchangePayload keyExchangeResponse;
+          try {
+            keyExchangeResponse = Payload.fromBytes(
+              await run.bluetoothSenderState.receiveRequestIdResponse(
+                keyExchangeRequestId.toInt(),
+              ),
+            ) as KeyExchangePayload;
+          } catch (_) {
+            // this can be considered to belong to the protocol
+            // ignore: invalid_use_of_protected_member
+            run.displayState.emit(
+              run.displayState.withChanges(
+                role,
+                .done,
+                DisplayResult(
+                  mode: .failure,
+                  errorMode: null,
+                  failureMode: .misformattedMessage,
+                ),
+              ),
+            );
+            throw _ProtocolBreakException(
+              "Bluetooth key exchange failed due to misformatted message.",
+            );
+          }
+          pgpPublicKeyOther = await decrypt(keyExchangeResponse.publicPgpKey);
+
+          final fingerprintA = _primaryPublicKeyPacket(pgpPublicKeyOther!);
+          final fingerprintB = _primaryPublicKeyPacket(pgpPublicKey);
+          final transcript = _formatTranscript(
+            sessionId: activeSessionId,
+            nonceA: base64Encode(nonceOther!),
+            nonceB: base64Encode(nonce),
+            ephemeralA: base64Encode(ephemeralPublicKeyOther!),
+            ephemeralB: base64Encode(ephemeralPublicKey.bytes),
+            fingerprintA: base64Encode(fingerprintA.fingerprint),
+            fingerprintB: base64Encode(fingerprintB.fingerprint),
+            capabilitiesA: Capabilities.fromMap(capabilitiesOther!).toInt(),
+            capabilitiesB: Capabilities.fromMap(capabilities).toInt(),
+            uwb: null, // TODO: cf. 1.3, PGPtouch definition; UWB is not yet specified
+          );
+          final signature = OpenPGP.signDetachedCleartext(transcript, [
+            privateKey,
+          ]).packetList.encode();
+
+          final signatureExchangeRequestId = rng.nextByte(3);
+          await executeForPagesOfContent(
+            await encrypt(signature),
+            (page, pageIndex, pageCount) async =>
+                await run.bluetoothSenderState.send(
+                  SignatureExchangePayload(
+                    requestId: signatureExchangeRequestId,
+                    detachedSignature: page,
+                    pageIndex: pageIndex,
+                    pages: pageCount,
+                  ).toBytes(),
+                ),
+          );
+          late final SignatureExchangePayload signatureExchangeResponse;
+          try {
+            signatureExchangeResponse = Payload.fromBytes(
+              await run.bluetoothSenderState.receiveRequestIdResponse(
+                signatureExchangeRequestId.toInt(),
+              ),
+            ) as SignatureExchangePayload;
+          } catch (_) {
+            // this can be considered to belong to the protocol
+            // ignore: invalid_use_of_protected_member
+            run.displayState.emit(
+              run.displayState.withChanges(
+                role,
+                .done,
+                DisplayResult(
+                  mode: .failure,
+                  errorMode: null,
+                  failureMode: .misformattedMessage,
+                ),
+              ),
+            );
+            throw _ProtocolBreakException(
+              "Bluetooth signature exchange failed due to misformatted message.",
+            );
+          }
+
+          final verification = CleartextMessage(transcript).verifyDetached(
+            [PublicKey(PacketList.decode(pgpPublicKeyOther!))],
+            Signature(
+              PacketList.decode(
+                await decrypt(signatureExchangeResponse.detachedSignature),
+              ).packets.whereType<SignaturePacket>(),
+            ),
+          ).first;
+          if (!verification.isVerified) {
+            // this can be considered to belong to the protocol
+            // ignore: invalid_use_of_protected_member
+            run.displayState.emit(
+              run.displayState.withChanges(
+                role,
+                .done,
+                DisplayResult(
+                  mode: .failure,
+                  errorMode: null,
+                  failureMode: .signatureVerificationFailed,
+                  additionalInfo: verification.verificationError,
+                ),
+              ),
+            );
+            throw _ProtocolBreakException(
+              "Bluetooth signature verification failed.",
+            );
+          }
+
+          // this can be considered to belong to the protocol
+          // ignore: invalid_use_of_protected_member
+          run.displayState.emit(
+            run.displayState.withChanges(
+              role,
+              .done,
+              DisplayResult(
+                mode: .success,
+                errorMode: null,
+                failureMode: null,
+                additionalInfo: (
+                  fingerprint: _primaryPublicKeyPacket(pgpPublicKeyOther!)
+                      .fingerprint,
+                  pgpKey: pgpPublicKeyOther!,
+                  userIds: verification.userIDs.toSet(),
+                ),
               ),
             ),
-          ),
-        );
-      } else if (role == ProtocolRole.serverSender) {
-        run.bluetoothSenderState.dispose();
-        await bluetoothReceiver.future.catchError(Error.throwWithStackTrace);
-        // behavior defined above
-      }
+          );
+        } else if (role == ProtocolRole.serverSender) {
+          run.bluetoothSenderState.dispose();
+          await bluetoothReceiver.future.catchError(Error.throwWithStackTrace);
+          // behavior defined above
+        }
+      })().timeout(
+        const Duration(seconds: 30),
+        onTimeout: () {
+          // this can be considered to belong to the protocol
+          // ignore: invalid_use_of_protected_member
+          run.displayState.emit(
+            run.displayState.withChanges(
+              null,
+              .done,
+              DisplayResult(
+                mode: .failure,
+                errorMode: null,
+                failureMode: .connectionFailed,
+              ),
+            ),
+          );
+          throw _ProtocolBreakException(
+            "Protocol run timed out after 30 seconds.",
+          );
+        },
+      );
     } on _ProtocolBreakException catch (_) {
       // The error should've been handled by a previous DisplayState update
     } finally {
@@ -1031,7 +1092,7 @@ enum DisplayFailureMode {
   connectionFailed,
 
   /// The signature on this device could not be generated correctly.
-  suppliedSignatureFailed,
+  suppliedKeysFailed,
 
   /// The verification of the signature of the other device failed.
   ///
@@ -1049,7 +1110,7 @@ final class DisplayResult {
   final DisplayErrorMode? errorMode;
   final DisplayFailureMode? failureMode;
 
-  final Object? additionalInfo;
+  final dynamic additionalInfo;
 
   DisplayResult({
     required this.mode,

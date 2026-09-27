@@ -4,6 +4,8 @@ library;
 import 'dart:math';
 import 'dart:typed_data';
 
+export 'src/byte_package.dart';
+export 'src/packages.dart';
 export 'src/protocol_manager.dart';
 
 extension RandomByte on Random {

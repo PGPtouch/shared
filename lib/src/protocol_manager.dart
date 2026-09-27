@@ -3,7 +3,7 @@ import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
 
-import 'package:cryptography/cryptography.dart' hide Signature, PublicKey;
+import 'package:cryptography/cryptography.dart' hide PublicKey, Signature;
 import 'package:dart_pg/dart_pg.dart' hide Uint8ListExt;
 import 'package:meta/meta.dart';
 import 'package:uuid/data.dart';
@@ -11,12 +11,17 @@ import 'package:uuid/rng.dart';
 import 'package:uuid/uuid.dart';
 
 import '../shared.dart';
-import 'byte_package.dart';
 import 'common_state.dart';
-import 'packages.dart';
 
 const bleCharacteristicRequest = "b92ab634-78c5-5407-95eb-b0c1c4c26d35";
 const bleCharacteristicResponse = "45f2cadc-dd84-5f49-9880-239d6328e79a";
+
+/// Placeholder app error code sent alongside protocol-level error reports.
+///
+/// The app error code is application-specific per the PGPtouch definition and
+/// left uninterpreted by this library; this constant is used as a generic
+/// non-zero marker wherever no application context is available.
+const _defaultAppErrorCode = 1;
 
 enum ProtocolRole { clientReceiver, serverSender }
 
@@ -37,18 +42,46 @@ final class ProtocolManager {
          bluetoothReceiverState: bluetoothReceiverState,
        );
 
+  /// Closes the protocol manager and releases any associated resources.
   Future<void> close() async => await run.close();
-  Future<void> start(Uint8List pgpPublicKey, Uint8List pgpPrivateKey) async {
+
+  /// Starts the protocol manager with the given PGP public and private keys.
+  ///
+  /// The keys are expected to be in the full framed OpenPGP packet-list format.
+  /// If the private key is passphrase-encrypted, [privateKeyPassphrase] must be
+  /// supplied to unlock it before it can be used for signing.
+  ///
+  /// You may use [isPrivateKeyEncrypted] to check beforehand, or you wait for
+  /// the [ArgumentError] thrown by this method if the private key is encrypted
+  /// but no passphrase is provided.
+  Future<void> start(
+    Uint8List pgpPublicKey,
+    Uint8List pgpPrivateKey, {
+    String? privateKeyPassphrase,
+  }) async {
     if (await run.bluetoothSenderState.isConnected()) {
       throw StateError("Bluetooth sender should not be connected at the start");
     }
+
+    final rawPrivateKey = PrivateKey(PacketList.decode(pgpPrivateKey));
+    if (rawPrivateKey.isEncrypted && privateKeyPassphrase == null) {
+      throw ArgumentError.value(
+        pgpPrivateKey,
+        "pgpPrivateKey",
+        "Private key is encrypted; privateKeyPassphrase is required",
+      );
+    }
+    final privateKey = rawPrivateKey.isEncrypted
+        ? rawPrivateKey.decrypt(privateKeyPassphrase!)
+        : rawPrivateKey;
 
     // this can be considered to belong to the protocol
     // ignore: invalid_use_of_protected_member
     run.displayState.emit(run.displayState.withChanges(null, .tapOther, null));
 
     final rng = Random.secure();
-    final random = rng.nextInt(256);
+    // cf. 1.1.1, PGPtouch definition: inclusive range of 1 to 255
+    final random = rng.nextInt(255) + 1;
     final nonce = rng.nextByte(32);
     final sessionId = Uuid(goptions: GlobalOptions(CryptoRNG())).v4obj();
     late String activeSessionId;
@@ -63,7 +96,8 @@ final class ProtocolManager {
     final capabilities = Capabilities(
       nfc: true,
       bluetooth: true,
-      uwb: false, // TODO: UWB supported
+      uwb:
+          false, // TODO: cf. 1.3, PGPtouch definition; UWB is not yet specified
     ).toMap();
 
     // SHARED
@@ -83,7 +117,7 @@ final class ProtocolManager {
         (await aesGcm!.encrypt(
           plaintext,
           secretKey: sendKey!,
-          nonce: (_nonceCounter++).toNBytes(AesGcm.defaultNonceLength),
+          nonce: (++_nonceCounter).toNBytes(AesGcm.defaultNonceLength),
         )).concatenation();
     Future<Uint8List> decrypt(Uint8List transmitted) async =>
         Uint8List.fromList(
@@ -96,6 +130,8 @@ final class ProtocolManager {
             secretKey: receiveKey!,
           ),
         );
+    // cf. 1.2.1, PGPtouch definition: the client uses the first 32 derived
+    // bytes, the server uses the last 32, regardless of message direction
     Future<void> finalizeSharedKeys(
       bool isClient,
       Uint8List sessionIdBytes,
@@ -113,10 +149,10 @@ final class ProtocolManager {
             nonce: sessionIdBytes,
             info: utf8.encode("PGPtouch/V1"),
           )).extractBytes();
-      final requestKeyBytes = hkdfBytes.sublist(0, 32);
-      final responseKeyBytes = hkdfBytes.sublist(32, 64);
-      sendKey = SecretKey(isClient ? requestKeyBytes : responseKeyBytes);
-      receiveKey = SecretKey(isClient ? responseKeyBytes : requestKeyBytes);
+      final clientKeyBytes = hkdfBytes.sublist(0, 32);
+      final serverKeyBytes = hkdfBytes.sublist(32, 64);
+      sendKey = SecretKey(isClient ? clientKeyBytes : serverKeyBytes);
+      receiveKey = SecretKey(isClient ? serverKeyBytes : clientKeyBytes);
       aesGcm = AesGcm.with256bits();
     }
 
@@ -185,7 +221,7 @@ final class ProtocolManager {
               await sendResponseWriteRequest(
                 ErrorReportPayload(
                   requestId: tmpRequestId,
-                  appErrorCode: 1,
+                  appErrorCode: _defaultAppErrorCode,
                   errorCode: .error.unableToReadContent,
                 ).toBytes(),
               );
@@ -216,7 +252,7 @@ final class ProtocolManager {
           await sendResponseWriteRequest(
             ErrorReportPayload(
               requestId: event.requestId,
-              appErrorCode: 1,
+              appErrorCode: _defaultAppErrorCode,
               errorCode: .error.headerIncompatible,
             ).toBytes(),
           );
@@ -286,7 +322,7 @@ final class ProtocolManager {
                 await sendResponseWriteRequest(
                   ErrorReportPayload(
                     requestId: tmpRequestId,
-                    appErrorCode: 1,
+                    appErrorCode: _defaultAppErrorCode,
                     errorCode: .error.unableToReadContent,
                   ).toBytes(),
                 );
@@ -350,13 +386,13 @@ final class ProtocolManager {
                 fingerprintB: base64Encode(fingerprintB.fingerprint),
                 capabilitiesA: Capabilities.fromMap(capabilities).toInt(),
                 capabilitiesB: Capabilities.fromMap(capabilitiesOther!).toInt(),
-                uwb: null, // TODO: replace with actual UWB capabilities
+                uwb: null, // TODO: cf. 1.3, PGPtouch definition; UWB is not yet specified
               );
 
               late final Uint8List signature;
               try {
                 signature = OpenPGP.signDetachedCleartext(transcript, [
-                  PrivateKey(PacketList.decode(pgpPrivateKey)),
+                  privateKey,
                 ]).packetList.encode();
               } catch (_) {
                 // this can be considered to belong to the protocol
@@ -397,7 +433,6 @@ final class ProtocolManager {
                       .whereType<SignaturePacket>(),
                 ),
               ).first;
-              print("S>> ${verification.isVerified}");
               if (!verification.isVerified) {
                 // this can be considered to belong to the protocol
                 // ignore: invalid_use_of_protected_member
@@ -433,7 +468,7 @@ final class ProtocolManager {
                       fingerprint: _primaryPublicKeyPacket(pgpPublicKeyOther!)
                           .fingerprint,
                       pgpKey: pgpPublicKeyOther!,
-                      userIds: verification.userIDs,
+                      userIds: verification.userIDs.toSet(),
                     ),
                   ),
                 ),
@@ -451,7 +486,7 @@ final class ProtocolManager {
           ).toBytes(),
         );
 
-        // TODO: start UWB processing
+        // TODO: cf. 1.3, PGPtouch definition; UWB is not yet specified
 
         activeSessionId = sessionId.toFormattedString();
         roleCompleter.complete();
@@ -627,7 +662,7 @@ final class ProtocolManager {
           // ignore: invalid_use_of_protected_member
           run.displayState.emit(
             run.displayState.withChanges(
-              null,
+              role,
               .done,
               DisplayResult(
                 mode: .failure,
@@ -654,10 +689,10 @@ final class ProtocolManager {
           fingerprintB: base64Encode(fingerprintB.fingerprint),
           capabilitiesA: Capabilities.fromMap(capabilitiesOther!).toInt(),
           capabilitiesB: Capabilities.fromMap(capabilities).toInt(),
-          uwb: null, // TODO: replace with actual UWB capabilities
+          uwb: null, // TODO: cf. 1.3, PGPtouch definition; UWB is not yet specified
         );
         final signature = OpenPGP.signDetachedCleartext(transcript, [
-          PrivateKey(PacketList.decode(pgpPrivateKey)),
+          privateKey,
         ]).packetList.encode();
 
         final signatureExchangeRequestId = rng.nextByte(3);
@@ -685,7 +720,7 @@ final class ProtocolManager {
           // ignore: invalid_use_of_protected_member
           run.displayState.emit(
             run.displayState.withChanges(
-              null,
+              role,
               .done,
               DisplayResult(
                 mode: .failure,
@@ -707,13 +742,12 @@ final class ProtocolManager {
             ).packets.whereType<SignaturePacket>(),
           ),
         ).first;
-        print("C>> ${verification.isVerified}");
         if (!verification.isVerified) {
           // this can be considered to belong to the protocol
           // ignore: invalid_use_of_protected_member
           run.displayState.emit(
             run.displayState.withChanges(
-              null,
+              role,
               .done,
               DisplayResult(
                 mode: .failure,
@@ -732,7 +766,7 @@ final class ProtocolManager {
         // ignore: invalid_use_of_protected_member
         run.displayState.emit(
           run.displayState.withChanges(
-            null,
+            role,
             .done,
             DisplayResult(
               mode: .success,
@@ -742,7 +776,7 @@ final class ProtocolManager {
                 fingerprint: _primaryPublicKeyPacket(pgpPublicKeyOther!)
                     .fingerprint,
                 pgpKey: pgpPublicKeyOther!,
-                userIds: verification.userIDs,
+                userIds: verification.userIDs.toSet(),
               ),
             ),
           ),
@@ -755,7 +789,6 @@ final class ProtocolManager {
     } on _ProtocolBreakException catch (_) {
       // The error should've been handled by a previous DisplayState update
     } finally {
-      pgpPublicKey.destroy();
       pgpPrivateKey.destroy();
 
       nonce.destroy();
@@ -766,7 +799,6 @@ final class ProtocolManager {
 
       nonceOther?.destroy();
       ephemeralPublicKeyOther?.destroy();
-      pgpPublicKeyOther?.destroy();
 
       run.nfcSenderState.dispose();
       run.nfcReceiverState.dispose();
@@ -837,9 +869,6 @@ final class ProtocolRun {
   final BluetoothSenderState bluetoothSenderState;
   final BluetoothReceiverState bluetoothReceiverState;
 
-  final _canceled = Completer<void>();
-  final _canceledAcknowledged = Completer<void>();
-
   ProtocolRun._({
     required this.displayState,
     required this.nfcSenderState,
@@ -849,10 +878,6 @@ final class ProtocolRun {
   });
 
   Future<void> close() async {
-    _canceled.complete();
-    _canceledAcknowledged.complete();
-    await _canceledAcknowledged.future;
-
     displayState.dispose();
     nfcSenderState.dispose();
     nfcReceiverState.dispose();
@@ -922,7 +947,7 @@ enum DisplayMode {
   ///
   /// Indicates that the operation was successful. If so,
   /// [DisplayResult.additionalInfo] will hold the following information:
-  /// `({Uint8List fingerprint, Uint8List pgpKey, List<String> userIds})`
+  /// `({Uint8List fingerprint, Uint8List pgpKey, Set<String> userIds})`
   success,
 
   /// Error transmitted by the other device.
@@ -1172,8 +1197,6 @@ final class BluetoothReceiverEvent extends Event<BluetoothReceiverState> {
   BluetoothReceiverEvent({required this.received});
 }
 
-enum BluetoothReceiverPairingState { idle, paired }
-
 /// Helper function to process multi-page protocol requests.
 ///
 /// It takes a [pageBuffer] that maps request IDs to lists of payload pages, and
@@ -1216,7 +1239,8 @@ Future<void> executeForPagesOfContent(
   callback,
 ) async {
   final pageSize = 500;
-  final pageCount = (content.length / pageSize).ceil();
+  // cf. 1.2, PGPtouch definition: the page count must be at least 1
+  final pageCount = content.isEmpty ? 1 : (content.length / pageSize).ceil();
   for (var i = 0; i < pageCount; i++) {
     final chunk = content.sublist(
       i * pageSize,
@@ -1225,6 +1249,10 @@ Future<void> executeForPagesOfContent(
     await Future.value(callback.call(chunk, i + 1, pageCount));
   }
 }
+
+/// Checks if the given PGP private key is encrypted.
+bool isPrivateKeyEncrypted(Uint8List pgpPrivateKey) =>
+    PrivateKey(PacketList.decode(pgpPrivateKey)).isEncrypted;
 
 PublicKeyPacket _primaryPublicKeyPacket(Uint8List framedPacketListBytes) =>
     PacketList.decode(framedPacketListBytes).packets

@@ -2,8 +2,8 @@ import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:dart_pg/dart_pg.dart';
-// import 'package:shared/src/byte_package.dart';
-import 'package:shared/src/protocol_manager.dart';
+import 'package:shared/shared.dart';
+import 'package:shared/src/user_id.dart';
 
 final class NfcSender extends NfcSenderState {
   /// Test-only pairing: a tap simulated in [start] is routed to this receiver.
@@ -16,7 +16,6 @@ final class NfcSender extends NfcSenderState {
   @override
   Future<void> start() async {
     final bytes = data!.toBytes();
-    // print(bytes.toDebugString());
     final receiver = pairedReceiver;
     if (receiver == null) return;
     // broadcast events emitted before the other side's listener attaches are
@@ -29,6 +28,9 @@ final class NfcSender extends NfcSenderState {
     for (var attempt = 0; attempt < 40; attempt++) {
       try {
         receiver.simulateTap(bytes);
+        // the disposed StreamController surfaces as a StateError; used here
+        // as an intentional signal rather than an exceptional condition
+        // ignore: avoid_catching_errors
       } on StateError {
         return; // the receiver was already disposed by the winning side
       }
@@ -88,34 +90,6 @@ final class BluetoothReceiver extends BluetoothReceiverState {
   ) => readRequestHandler(data, sendResponseWriteRequest);
 }
 
-// PrivateKey.decrypt() keeps the still-encrypted ciphertext bytes for
-// serialization and only exposes the decrypted material in memory, so
-// encode()+PacketList.decode() would silently lose it; rebuild the secret
-// key/subkey packets with s2kUsage none (plaintext) so it round-trips.
-Uint8List unlockedPrivateKeyBytes(dynamic key, String passphrase) {
-  final decrypted = key.decrypt(passphrase);
-  final packetList = decrypted.packetList;
-  for (var i = 0; i < packetList.length; i++) {
-    final packet = packetList[i];
-    if (packet is SecretSubkeyPacket) {
-      final material = packet.secretKeyMaterial!;
-      packetList[i] = SecretSubkeyPacket(
-        packet.publicKey as PublicSubkeyPacket,
-        material.toBytes,
-        secretKeyMaterial: material,
-      );
-    } else if (packet is SecretKeyPacket) {
-      final material = packet.secretKeyMaterial!;
-      packetList[i] = SecretKeyPacket(
-        packet.publicKey,
-        material.toBytes,
-        secretKeyMaterial: material,
-      );
-    }
-  }
-  return packetList.encode();
-}
-
 void main(List<String> args) async {
   final aNfcReceiver = NfcReceiver();
   final bNfcReceiver = NfcReceiver();
@@ -135,18 +109,36 @@ void main(List<String> args) async {
     bluetoothReceiverState: bBluetoothReceiver,
   );
 
+  String debugFormatAdditionalInfo(String additionalInfo) {
+    String decimalToHex(String value) =>
+        int.parse(value).toRadixString(16).padLeft(2, "0").toUpperCase();
+
+    var tmp = additionalInfo;
+    tmp = tmp.replaceAllMapped(
+      RegExp(r"(?<=fingerprint: \[).*?(?=\])"),
+      (m) => m.group(0)!.split(", ").map(decimalToHex).join(", "),
+    );
+    tmp = tmp.replaceAllMapped(
+      RegExp(r"(?<=userIds: \{).*?(?=\})"),
+      (m) => m.group(0)!.split(", ").map(UserId.tryParse).join(", "),
+    );
+    return tmp;
+  }
+
   deviceA.run.displayState.events.listen(
     (e) => print(
       "A: ${e.contactMode.value} role=${e.deviceRole.value} "
       "error=${e.result.value?.errorMode} "
-      "failure=${e.result.value?.failureMode}",
+      "failure=${e.result.value?.failureMode} "
+      "additionalInfo=${debugFormatAdditionalInfo((e.result.value?.additionalInfo).toString())}",
     ),
   );
   deviceB.run.displayState.events.listen(
     (e) => print(
       "B: ${e.contactMode.value} role=${e.deviceRole.value} "
       "error=${e.result.value?.errorMode} "
-      "failure=${e.result.value?.failureMode}",
+      "failure=${e.result.value?.failureMode} "
+      "additionalInfo=${debugFormatAdditionalInfo((e.result.value?.additionalInfo).toString())}",
     ),
   );
 
@@ -156,24 +148,32 @@ void main(List<String> args) async {
   // RSA is used since dart_pg 2.1.0 only implements OpenPGP signing for RSA
   // and EdDSA (whose ed25519 key generation has a flaky self-verify bug)
   final keyA = OpenPGP.generateKey(
-    ['Device A <a@example.com>'],
-    'passphraseA',
+    ["Device A (Never gonna) <a@example.com>"],
+    "passphraseA",
     type: KeyType.rsa,
   );
   final keyB = OpenPGP.generateKey(
-    ['Device B <b@example.com>'],
-    'passphraseB',
+    ["Device B (Give you up) <b@example.com>"],
+    "passphraseB",
     type: KeyType.rsa,
   );
   final pgpPublicKeyA = keyA.publicKey.packetList.encode();
-  final pgpPrivateKeyA = unlockedPrivateKeyBytes(keyA, 'passphraseA');
+  final pgpPrivateKeyA = keyA.packetList.encode();
   final pgpPublicKeyB = keyB.publicKey.packetList.encode();
-  final pgpPrivateKeyB = unlockedPrivateKeyBytes(keyB, 'passphraseB');
+  final pgpPrivateKeyB = keyB.packetList.encode();
 
   await Future.wait(
     [
-      deviceA.start(pgpPublicKeyA, pgpPrivateKeyA),
-      deviceB.start(pgpPublicKeyB, pgpPrivateKeyB),
+      deviceA.start(
+        pgpPublicKeyA,
+        pgpPrivateKeyA,
+        privateKeyPassphrase: "passphraseA",
+      ),
+      deviceB.start(
+        pgpPublicKeyB,
+        pgpPrivateKeyB,
+        privateKeyPassphrase: "passphraseB",
+      ),
     ],
     eagerError: true,
   ).timeout(const Duration(seconds: 5), onTimeout: () => const []);

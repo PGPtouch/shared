@@ -2,8 +2,6 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:shared/shared.dart';
-import 'package:shared/src/byte_package.dart';
-import 'package:shared/src/packages.dart';
 
 void main() {
   final rng = Random.secure();

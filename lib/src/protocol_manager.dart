@@ -59,15 +59,15 @@ final class ProtocolManager {
     Uint8List pgpPrivateKey, {
     String? privateKeyPassphrase,
   }) async {
-    if (await run.bluetoothSenderState.isConnected()) {
-      throw StateError("Bluetooth sender should not be connected at the start");
-    }
-
     // this can be considered to belong to the protocol
     // ignore: invalid_use_of_protected_member
     run.displayState.emit(
       run.displayState.withChanges(null, .initializing, null),
     );
+
+    if (await run.bluetoothSenderState.isConnected()) {
+      throw StateError("Bluetooth sender should not be connected at the start");
+    }
 
     final nfcReceiverAvailable = await Future.value(
       run.nfcReceiverState.isAvailable(),

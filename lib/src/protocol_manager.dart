@@ -610,6 +610,13 @@ final class ProtocolManager {
                   "NFC negotiation failed due to connection failure.",
                 );
               }
+
+              // this can be considered to belong to the protocol
+              // ignore: invalid_use_of_protected_member
+              run.displayState.emit(
+                run.displayState.withChanges(null, .holdOther, null),
+              );
+
               if (!payload.initializerMatchesImplementation()) {
                 // this can be considered to belong to the protocol
                 // ignore: invalid_use_of_protected_member
@@ -978,11 +985,11 @@ final class ProtocolRun {
   });
 
   Future<void> close() async {
-    displayState.dispose();
-    nfcSenderState.dispose();
-    nfcReceiverState.dispose();
-    bluetoothSenderState.dispose();
-    bluetoothReceiverState.dispose();
+    await displayState.dispose();
+    await nfcSenderState.dispose();
+    await nfcReceiverState.dispose();
+    await bluetoothSenderState.dispose();
+    await bluetoothReceiverState.dispose();
   }
 }
 

@@ -421,7 +421,7 @@ final class ProtocolManager {
                   signature = OpenPGP.signDetachedCleartext(transcript, [
                     privateKey,
                   ]).packetList.encode();
-                } catch (_) {
+                } catch (e) {
                   // this can be considered to belong to the protocol
                   // ignore: invalid_use_of_protected_member
                   run.displayState.emit(
@@ -432,6 +432,7 @@ final class ProtocolManager {
                         mode: .failure,
                         errorMode: null,
                         failureMode: .suppliedKeysFailed,
+                        additionalInfo: e,
                       ),
                     ),
                   );
@@ -745,9 +746,29 @@ final class ProtocolManager {
             capabilitiesB: Capabilities.fromMap(capabilities).toInt(),
             uwb: null, // TODO: cf. 1.3, PGPtouch definition; UWB is not yet specified
           );
-          final signature = OpenPGP.signDetachedCleartext(transcript, [
-            privateKey,
-          ]).packetList.encode();
+          final signature = await () async {
+            try {
+              return OpenPGP.signDetachedCleartext(transcript, [
+                privateKey,
+              ]).packetList.encode();
+            } catch (e) {
+              // this can be considered to belong to the protocol
+              // ignore: invalid_use_of_protected_member
+              run.displayState.emit(
+                run.displayState.withChanges(
+                  role,
+                  .done,
+                  DisplayResult(
+                    mode: .failure,
+                    errorMode: null,
+                    failureMode: .suppliedKeysFailed,
+                    additionalInfo: e,
+                  ),
+                ),
+              );
+              throw _ProtocolBreakException("Supplied signature failed");
+            }
+          }();
 
           final signatureExchangeRequestId = rng.nextByte(3);
           await executeForPagesOfContent(
@@ -1089,6 +1110,9 @@ enum DisplayFailureMode {
   connectionFailed,
 
   /// The signature on this device could not be generated correctly.
+  ///
+  /// If this is set, [DisplayResult.additionalInfo] contains the underlying
+  /// error thrown while signing.
   suppliedKeysFailed,
 
   /// The verification of the signature of the other device failed.

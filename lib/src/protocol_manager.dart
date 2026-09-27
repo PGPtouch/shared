@@ -206,13 +206,6 @@ final class ProtocolManager {
             roleBluetoothReceiverCompleter.complete(ProtocolRole.serverSender);
             return;
           }
-
-          // this can be considered to belong to the protocol
-          // ignore: invalid_use_of_protected_member
-          run.displayState.emit(
-            run.displayState.withChanges(null, .holdOther, null),
-          );
-
           late final HandshakePayload event;
           try {
             final tmpEvent = Payload.fromBytes(data);
@@ -509,8 +502,9 @@ final class ProtocolManager {
                     ),
                   ),
                 );
-                if (!bluetoothReceiver.isCompleted)
+                if (!bluetoothReceiver.isCompleted) {
                   bluetoothReceiver.complete();
+                }
               default:
                 // this can be considered to belong to the protocol
                 // ignore: invalid_use_of_protected_member
@@ -527,6 +521,12 @@ final class ProtocolManager {
                 );
             }
           });
+
+          // this can be considered to belong to the protocol
+          // ignore: invalid_use_of_protected_member
+          run.displayState.emit(
+            run.displayState.withChanges(null, .holdOther, null),
+          );
 
           await sendResponseWriteRequest(
             HandshakePayload(
@@ -557,13 +557,6 @@ final class ProtocolManager {
                 // just exit the loop if the role has already been determined
                 return ProtocolRole.clientReceiver;
               }
-
-              // this can be considered to belong to the protocol
-              // ignore: invalid_use_of_protected_member
-              run.displayState.emit(
-                run.displayState.withChanges(null, .holdOther, null),
-              );
-
               late final NfcBootstrap payload;
               try {
                 payload = NfcBootstrap.fromBytes(event.received!);
@@ -852,7 +845,7 @@ final class ProtocolManager {
       await runtime()
           .catchError(Error.throwWithStackTrace)
           .timeout(
-            const Duration(seconds: 30),
+            const Duration(seconds: 20),
             onTimeout: () {
               // this can be considered to belong to the protocol
               // ignore: invalid_use_of_protected_member
@@ -868,7 +861,7 @@ final class ProtocolManager {
                 ),
               );
               throw _ProtocolBreakException(
-                "Protocol run timed out after 30 seconds.",
+                "Protocol run timed out after 20 seconds.",
               );
             },
           );

@@ -188,6 +188,7 @@ final class ProtocolManager {
               ))
             .start();
       }
+      await run.nfcReceiverState.start();
 
       final roleCompleter = Completer();
       final roleBluetoothReceiverCompleter = Completer<ProtocolRole>();

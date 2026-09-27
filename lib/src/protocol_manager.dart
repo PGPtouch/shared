@@ -683,12 +683,12 @@ final class ProtocolManager {
           run.displayState.withChanges(role, .holdOther, null),
         );
 
-        run.nfcSenderState.dispose();
-        run.nfcReceiverState.dispose();
+        await run.nfcSenderState.dispose();
+        await run.nfcReceiverState.dispose();
         if (role == ProtocolRole.clientReceiver) {
           // MARK: Client Runtime
           bluetoothReceiver.complete();
-          run.bluetoothReceiverState.dispose();
+          await run.bluetoothReceiverState.dispose();
 
           await run.bluetoothSenderState.send(
             HandshakePayload(
@@ -864,7 +864,7 @@ final class ProtocolManager {
             ),
           );
         } else if (role == ProtocolRole.serverSender) {
-          run.bluetoothSenderState.dispose();
+          await run.bluetoothSenderState.dispose();
           await bluetoothReceiver.future.catchError(Error.throwWithStackTrace);
           // behavior defined above
         }
@@ -907,10 +907,10 @@ final class ProtocolManager {
       nonceOther?.destroy();
       ephemeralPublicKeyOther?.destroy();
 
-      run.nfcSenderState.dispose();
-      run.nfcReceiverState.dispose();
-      run.bluetoothSenderState.dispose();
-      run.bluetoothReceiverState.dispose();
+      await run.nfcSenderState.dispose();
+      await run.nfcReceiverState.dispose();
+      await run.bluetoothSenderState.dispose();
+      await run.bluetoothReceiverState.dispose();
     }
   }
 

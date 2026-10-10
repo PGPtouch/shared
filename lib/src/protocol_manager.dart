@@ -552,8 +552,14 @@ final class ProtocolManager {
               late final NfcReceiverEvent event;
               try {
                 event = await run.nfcReceiverState.events.first;
-                if (event.received == null) continue;
-              } catch (_) {}
+                // just exit the loop if the events stream is closed
+                // ignore: avoid_catching_errors
+              } on StateError {
+                throw _ProtocolBreakException(
+                  "NFC negotiation failed due to closed events stream.",
+                );
+              }
+              if (event.received == null) continue;
               if (roleCompleter.isCompleted) {
                 // just exit the loop if the role has already been determined
                 return ProtocolRole.clientReceiver;

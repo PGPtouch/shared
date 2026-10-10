@@ -454,15 +454,11 @@ final class ProtocolManager {
                   ),
                 );
 
-                final verification = CleartextMessage(transcript)
-                    .verifyDetached(
-                      [PublicKey(PacketList.decode(pgpPublicKeyOther!))],
-                      Signature(
-                        PacketList.decode(signatureOther).packets
-                            .whereType<SignaturePacket>(),
-                      ),
-                    )
-                    .first;
+                final verification = verifyTranscriptSignature(
+                  transcript,
+                  pgpPublicKeyOther!,
+                  signatureOther,
+                );
                 if (!verification.isVerified) {
                   // this can be considered to belong to the protocol
                   // ignore: invalid_use_of_protected_member
@@ -498,7 +494,7 @@ final class ProtocolManager {
                         fingerprint: _primaryPublicKeyPacket(pgpPublicKeyOther!)
                             .fingerprint,
                         pgpKey: pgpPublicKeyOther!,
-                        userIds: verification.userIDs.toSet(),
+                        userIds: verification.userIds.toSet(),
                       ),
                     ),
                   ),
@@ -822,14 +818,11 @@ final class ProtocolManager {
             );
           }
 
-          final verification = CleartextMessage(transcript).verifyDetached(
-            [PublicKey(PacketList.decode(pgpPublicKeyOther!))],
-            Signature(
-              PacketList.decode(
-                await decrypt(signatureExchangeResponse.detachedSignature),
-              ).packets.whereType<SignaturePacket>(),
-            ),
-          ).first;
+          final verification = verifyTranscriptSignature(
+            transcript,
+            pgpPublicKeyOther!,
+            await decrypt(signatureExchangeResponse.detachedSignature),
+          );
           if (!verification.isVerified) {
             // this can be considered to belong to the protocol
             // ignore: invalid_use_of_protected_member
@@ -864,7 +857,7 @@ final class ProtocolManager {
                   fingerprint: _primaryPublicKeyPacket(pgpPublicKeyOther!)
                       .fingerprint,
                   pgpKey: pgpPublicKeyOther!,
-                  userIds: verification.userIDs.toSet(),
+                  userIds: verification.userIds.toSet(),
                 ),
               ),
             ),
@@ -1390,3 +1383,90 @@ PublicKeyPacket _primaryPublicKeyPacket(Uint8List framedPacketListBytes) =>
     PacketList.decode(framedPacketListBytes).packets
         .whereType<PublicKeyPacket>()
         .first;
+
+typedef TranscriptVerification = ({
+  bool isVerified,
+  String verificationError,
+  Iterable<String> userIds,
+});
+
+/// Verifies the detached [signatureBytes] over [transcript] using
+/// [publicKeyBytes].
+///
+/// Unlike [CleartextMessage.verifyDetached], this deliberately ignores the
+/// signature creation time: the transcript already binds the signature to this
+/// session through its nonces and ephemeral keys, while the wall clocks of two
+/// independent devices are not synchronized, so a signer whose clock runs ahead
+/// of the verifier would otherwise be rejected with "Signature is expired.".
+@visibleForTesting
+TranscriptVerification verifyTranscriptSignature(
+  String transcript,
+  Uint8List publicKeyBytes,
+  Uint8List signatureBytes,
+) {
+  bool bytesEqual(Uint8List a, Uint8List b) {
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+
+  final publicKey = PublicKey(PacketList.decode(publicKeyBytes));
+  final keyPacket = publicKey.keyPacket;
+  final userIds = publicKey.users
+      .where((user) => user.userID.isNotEmpty)
+      .map((user) => user.userID)
+      .toList();
+  TranscriptVerification failure(String error) =>
+      (isVerified: false, verificationError: error, userIds: userIds);
+
+  final signature = PacketList.decode(signatureBytes).packets
+      .whereType<SignaturePacket>()
+      .where((packet) => bytesEqual(packet.issuerKeyID, keyPacket.keyID))
+      .firstOrNull;
+  if (signature == null) {
+    return failure("No signature issued by the given public key.");
+  }
+  if (signature.keyAlgorithm != keyPacket.keyAlgorithm) {
+    return failure(
+      "Key algorithm used to sign does not match issuer key algorithm.",
+    );
+  }
+
+  final message = Uint8List.fromList([
+    ...signature.salt,
+    ...LiteralDataPacket.fromText(transcript).signBytes,
+    ...signature.signatureData,
+    signature.version,
+    0xff,
+    ...(ByteData(
+      4,
+    )..setUint32(0, signature.signatureData.length)).buffer.asUint8List(),
+  ]);
+  final hash = Helper.hashDigest(message, signature.hashAlgorithm);
+  if (signature.signedHashValue[0] != hash[0] ||
+      signature.signedHashValue[1] != hash[1]) {
+    return failure('Assertion failed: "Signed digest did not match!"');
+  }
+
+  // dart_pg doesn't export VerificationKeyMaterial, so call it dynamically
+  final dynamic keyMaterial = keyPacket.keyMaterial;
+  try {
+    final isVerified = keyMaterial.verify(
+      message,
+      signature.hashAlgorithm,
+      signature.signature,
+    ) as bool;
+    return (
+      isVerified: isVerified,
+      verificationError: isVerified ? "" : "Signature verification failed.",
+      userIds: userIds,
+    );
+    // dart_pg signals failures with Errors
+    // ignore: avoid_catching_errors
+  } on Error catch (error) {
+    // malformed signature values or unsupported key material
+    return failure(error.toString());
+  }
+}

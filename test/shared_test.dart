@@ -1,9 +1,12 @@
 import 'dart:typed_data';
 
+import 'package:dart_pg/dart_pg.dart' hide Uint8ListExt;
 import 'package:shared/src/packages.dart';
+import 'package:shared/src/protocol_manager.dart';
 import 'package:test/test.dart';
 
 void main() {
+  signatureTests();
   test('round-trips NfyBootstrap', () {
     final package = NfcBootstrap(
       random: 7,
@@ -83,5 +86,67 @@ void main() {
     expect(error.requestId, orderedEquals(package.requestId));
     expect(error.appErrorCode, 3);
     expect(error.errorCode, PayloadType.error.pageTimeout);
+  });
+}
+
+void signatureTests() {
+  group('verifyTranscriptSignature', () {
+    final key =
+        OpenPGP.generateKey(['Test <test@example.com>'], 'pw') as PrivateKey;
+    final otherKey =
+        OpenPGP.generateKey(['Other <other@example.com>'], 'pw') as PrivateKey;
+    final publicKey = Uint8List.fromList(key.publicKey.packetList.encode());
+    const transcript = 'session\nnonce';
+
+    Uint8List sign(String text, DateTime time, PrivateKey signer) =>
+        Uint8List.fromList(
+          CleartextMessage(text)
+              .signDetached([signer], time: time)
+              .packetList
+              .encode(),
+        );
+
+    test('accepts signatures from a clock that is ahead', () {
+      final signature = sign(
+        transcript,
+        DateTime.now().add(const Duration(minutes: 5)),
+        key,
+      );
+      final result = verifyTranscriptSignature(
+        transcript,
+        publicKey,
+        signature,
+      );
+      expect(result.isVerified, isTrue);
+      expect(result.userIds, contains('Test <test@example.com>'));
+    });
+
+    test('rejects a different transcript', () {
+      final signature = sign('other', DateTime.now(), key);
+      expect(
+        verifyTranscriptSignature(transcript, publicKey, signature).isVerified,
+        isFalse,
+      );
+    });
+
+    test('rejects a signature with corrupted signature material', () {
+      final signature = sign(transcript, DateTime.now(), key);
+      signature[signature.length - 1] ^= 0xff;
+      final result = verifyTranscriptSignature(
+        transcript,
+        publicKey,
+        signature,
+      );
+      expect(result.isVerified, isFalse);
+      expect(result.verificationError, isNotEmpty);
+    });
+
+    test('rejects a signature from a different key', () {
+      final signature = sign(transcript, DateTime.now(), otherKey);
+      expect(
+        verifyTranscriptSignature(transcript, publicKey, signature).isVerified,
+        isFalse,
+      );
+    });
   });
 }

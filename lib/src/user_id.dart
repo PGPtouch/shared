@@ -1,9 +1,9 @@
 class UserId {
-  final String name;
+  final String? name;
   final String? comment;
   final String email;
 
-  UserId({required this.name, this.comment, required this.email});
+  UserId({this.name, this.comment, required this.email});
 
   factory UserId.parse(String userIdString) {
     final regex = RegExp(r"^(.*?)\s*(?:\((.*?)\))?\s*<(.+?)>$");
@@ -15,16 +15,11 @@ class UserId {
         "Invalid user ID format",
       );
     }
-    final name = match.group(1)!;
+    final rawName = match.group(1)!;
+    final name = rawName.isEmpty ? null : rawName;
     final comment = match.group(2);
     final email = match.group(3)!;
-    if (name.isEmpty) {
-      throw ArgumentError.value(
-        userIdString,
-        "userIdString",
-        "Name cannot be empty",
-      );
-    } else if (email.isEmpty) {
+    if (email.isEmpty) {
       throw ArgumentError.value(
         userIdString,
         "userIdString",
@@ -44,8 +39,9 @@ class UserId {
 
   @override
   String toString() {
-    final comment = this.comment != null ? " (${this.comment})" : null;
-    return "$name$comment <$email>";
+    final namePart = name ?? "";
+    final commentPart = comment != null ? " ($comment)" : "";
+    return "$namePart$commentPart <$email>".trim();
   }
 
   @override
@@ -69,4 +65,7 @@ void main(List<String> args) {
 
   final userId3 = UserId.tryParse("Invalid User <incomplete.email@tag");
   print(userId3);
+
+  final userId4 = UserId(email: "anonymous@example.com");
+  print(userId4);
 }

@@ -1,8 +1,11 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
+import 'dart:isolate';
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'package:collection/collection.dart' show ListEquality;
 import 'package:cryptography/cryptography.dart' hide PublicKey, Signature;
 import 'package:dart_pg/dart_pg.dart' hide Uint8ListExt;
 import 'package:meta/meta.dart';
@@ -12,6 +15,7 @@ import 'package:uuid/uuid.dart';
 
 import '../shared.dart';
 import 'common_state.dart';
+import 'user_id.dart';
 
 const bleCharacteristicRequest = "b92ab634-78c5-5407-95eb-b0c1c4c26d35";
 const bleCharacteristicResponse = "45f2cadc-dd84-5f49-9880-239d6328e79a";
@@ -23,7 +27,105 @@ const bleCharacteristicResponse = "45f2cadc-dd84-5f49-9880-239d6328e79a";
 /// non-zero marker wherever no application context is available.
 const _defaultAppErrorCode = 1;
 
+/// Default time to wait between the pages of a multi-page message.
+///
+/// Much shorter than the overall run timeout, so a stalled transfer is noticed
+/// quickly.
+const defaultPageTimeout = Duration(seconds: 3);
+
 enum ProtocolRole { clientReceiver, serverSender }
+
+/// Outcome of comparing this device's bootstrap values to the other device's.
+@visibleForTesting
+enum RoleDecision {
+  /// This device waits to be connected to.
+  serverSender,
+
+  /// This device connects to the other one.
+  clientReceiver,
+
+  /// Both random bytes and nonces are equal; no role can be assigned.
+  undecidable,
+}
+
+/// Decides the role of this device.
+@visibleForTesting
+RoleDecision decideRole({
+  required int randomSelf,
+  required Uint8List nonceSelf,
+  required int randomOther,
+  required Uint8List nonceOther,
+}) {
+  if (randomSelf != randomOther) {
+    return randomSelf > randomOther
+        ? RoleDecision.serverSender
+        : RoleDecision.clientReceiver;
+  }
+  final nonceComparison = nonceSelf.toBigInt().compareTo(nonceOther.toBigInt());
+  if (nonceComparison == 0) return RoleDecision.undecidable;
+  return nonceComparison > 0
+      ? RoleDecision.serverSender
+      : RoleDecision.clientReceiver;
+}
+
+typedef _NfcInbound = ({Uint8List data, bool loopback});
+
+typedef _SessionKeys = ({SecretKey shared, SecretKey send, SecretKey receive});
+
+/// Buffers the events of a (broadcast) [Stream] from the moment of creation, so
+/// that events emitted while the consumer is busy are not lost.
+///
+/// Multiple streams are merged; the queue is closed once all of them are done.
+final class _EventQueue<T> {
+  final _buffer = Queue<T>();
+  final _subscriptions = <StreamSubscription<T>>[];
+  Completer<void>? _waiting;
+  bool _closed = false;
+
+  _EventQueue(Iterable<Stream<T>> streams) {
+    var open = streams.length;
+    for (final stream in streams) {
+      _subscriptions.add(
+        stream.listen(
+          (event) {
+            _buffer.add(event);
+            _wake();
+          },
+          onDone: () {
+            if (--open > 0) return;
+            _closed = true;
+            _wake();
+          },
+        ),
+      );
+    }
+    if (open == 0) _closed = true;
+  }
+
+  /// Returns the next event; throws a [StateError] once the stream is closed
+  /// (or this queue cancelled) and no buffered events are left.
+  Future<T> next() async {
+    while (_buffer.isEmpty) {
+      if (_closed) throw StateError("No more events.");
+      final waiting = _waiting = Completer<void>();
+      await waiting.future;
+    }
+    return _buffer.removeFirst();
+  }
+
+  Future<void> cancel() async {
+    _closed = true;
+    _buffer.clear();
+    _wake();
+    await Future.wait(_subscriptions.map((s) => s.cancel()));
+  }
+
+  void _wake() {
+    final waiting = _waiting;
+    _waiting = null;
+    if (waiting != null && !waiting.isCompleted) waiting.complete();
+  }
+}
 
 final class ProtocolManager {
   final ProtocolRun run;
@@ -90,7 +192,10 @@ final class ProtocolManager {
       );
     }
     final privateKey = rawPrivateKey.isEncrypted
-        ? rawPrivateKey.decrypt(privateKeyPassphrase!)
+        ? await _decryptPrivateKeyInIsolate(
+            rawPrivateKey,
+            privateKeyPassphrase!,
+          )
         : rawPrivateKey;
 
     // this can be considered to belong to the protocol
@@ -98,9 +203,17 @@ final class ProtocolManager {
     run.displayState.emit(run.displayState.withChanges(null, .tapOther, null));
 
     final rng = Random.secure();
-    // cf. 1.1.1, PGPtouch definition: inclusive range of 1 to 255
+    _nonceCounter = 0;
     final random = rng.nextInt(255) + 1;
     final nonce = rng.nextByte(32);
+    final usedRequestIds = <int>{};
+    Uint8List newRequestId() {
+      while (true) {
+        final id = rng.nextByte(3);
+        if (usedRequestIds.add(id.toInt())) return id;
+      }
+    }
+
     final sessionId = Uuid(goptions: GlobalOptions(CryptoRNG())).v4obj();
     late String activeSessionId;
 
@@ -148,34 +261,537 @@ final class ProtocolManager {
             secretKey: receiveKey!,
           ),
         );
+
     // cf. 1.2.1, PGPtouch definition: the client uses the first 32 derived
     // bytes, the server uses the last 32, regardless of message direction
-    Future<void> finalizeSharedKeys(
+    // Does not touch any shared state, so a peer's key can be validated before
+    // this device commits to a role. Throws for keys that make the Diffie-
+    // Hellman result predictable (all low-order points yield all zeros).
+    Future<_SessionKeys> deriveSessionKeys(
       bool isClient,
       Uint8List sessionIdBytes,
+      Uint8List remoteEphemeralPublicKey,
     ) async {
-      ephemeralSecretKey = await x25519.sharedSecretKey(
+      final shared = await x25519.sharedSecretKey(
         keyPair: ephemeralKeyPair,
         remotePublicKey: SimplePublicKey(
-          ephemeralPublicKeyOther!,
+          remoteEphemeralPublicKey,
           type: KeyPairType.x25519,
         ),
       );
-      final hkdfBytes =
-          await (await Hkdf(hmac: Hmac.sha512(), outputLength: 64).deriveKey(
-            secretKey: ephemeralSecretKey!,
+      final sharedBytes = await shared.extractBytes();
+      var accumulator = 0;
+      for (final byte in sharedBytes) {
+        accumulator |= byte;
+      }
+      if (accumulator == 0) {
+        shared.destroy();
+        throw StateError("Peer X25519 key yields a degenerate shared secret.");
+      }
+
+      final derived = await Hkdf(hmac: Hmac.sha512(), outputLength: 64)
+          .deriveKey(
+            secretKey: shared,
             nonce: sessionIdBytes,
             info: utf8.encode("PGPtouch/V1"),
-          )).extractBytes();
+          );
+      final hkdfBytes = await derived.extractBytes();
       final clientKeyBytes = hkdfBytes.sublist(0, 32);
       final serverKeyBytes = hkdfBytes.sublist(32, 64);
-      sendKey = SecretKey(isClient ? clientKeyBytes : serverKeyBytes);
-      receiveKey = SecretKey(isClient ? serverKeyBytes : clientKeyBytes);
+      derived.destroy();
+      return (
+        shared: shared,
+        send: SecretKey(isClient ? clientKeyBytes : serverKeyBytes),
+        receive: SecretKey(isClient ? serverKeyBytes : clientKeyBytes),
+      );
+    }
+
+    void installSessionKeys(_SessionKeys keys) {
+      ephemeralSecretKey = keys.shared;
+      sendKey = keys.send;
+      receiveKey = keys.receive;
       aesGcm = AesGcm.with256bits();
     }
 
+    var finished = false;
+    ProtocolRole? claimedRole;
+    bool claimRole(ProtocolRole candidate) {
+      claimedRole ??= candidate;
+      return claimedRole == candidate;
+    }
+
+    void showDisplay(
+      ProtocolRole? deviceRole,
+      DisplayContactMode contactMode,
+      DisplayResult? result,
+    ) {
+      if (finished) return;
+      // this can be considered to belong to the protocol
+      // ignore: invalid_use_of_protected_member
+      run.displayState.emit(
+        run.displayState.withChanges(
+          deviceRole ?? claimedRole,
+          contactMode,
+          result,
+        ),
+      );
+    }
+
+    void showFailure(DisplayFailureMode mode, {Object? additionalInfo}) =>
+        showDisplay(
+          null,
+          .done,
+          DisplayResult(
+            mode: .failure,
+            errorMode: null,
+            failureMode: mode,
+            additionalInfo: additionalInfo,
+          ),
+        );
+
+    final roleDecided = Completer<ProtocolRole>()..future.ignore();
+    final serverDone = Completer<void>()..future.ignore();
+    var serverSignatureSent = false;
+    void abort(String reason) {
+      final error = _ProtocolBreakException(reason);
+      if (!roleDecided.isCompleted) roleDecided.completeError(error);
+      if (!serverDone.isCompleted) serverDone.completeError(error);
+    }
+
+    final nfcEvents = _EventQueue<_NfcInbound>([
+      run.nfcReceiverState.events.expand(
+        (e) => [if (e.received != null) (data: e.received!, loopback: false)],
+      ),
+      run.nfcSenderState.events.expand(
+        (e) => [if (e.received != null) (data: e.received!, loopback: true)],
+      ),
+    ]);
+
+    // Any NFC activity (our card being selected, a bootstrap read or pushed)
+    // proves a physical contact. Until then the BLE server ignores everyone,
+    // since the session ID is advertised in the clear.
+    var nfcContact = false;
+    final nfcContactSubscriptions = [
+      run.nfcSenderState.events.listen((_) => nfcContact = true),
+      run.nfcReceiverState.events.listen((_) => nfcContact = true),
+    ];
+    // The bootstrap of the peer that decided this device to be the server. Its
+    // BLE handshake has to carry exactly these values.
+    NfcBootstrap? expectedPeer;
+
     try {
       Future<void> runtime() async {
+        Future<void> reportUnreadable(
+          Uint8List data,
+          Future<void> Function(Uint8List) respond,
+        ) async {
+          if (data.length < 7) return;
+          final requestId = data.sublist(4, 7);
+          if (requestId.toIntOrNull() == null) return;
+          try {
+            await respond(
+              ErrorReportPayload(
+                requestId: requestId,
+                appErrorCode: _defaultAppErrorCode,
+                errorCode: .error.unableToReadContent,
+              ).toBytes(),
+            ).timeout(const Duration(seconds: 2));
+          } catch (_) {
+            // the other device may already be gone
+          }
+        }
+
+        Future<void> rejectUnreadable(
+          Uint8List data,
+          Future<void> Function(Uint8List) respond,
+        ) async {
+          await reportUnreadable(data, respond);
+          showFailure(.misformattedMessage);
+          abort("Bluetooth negotiation failed due to unreadable content.");
+        }
+
+        Future<Payload?> readIncoming(
+          Uint8List data,
+          Future<void> Function(Uint8List) respond,
+        ) async {
+          final Payload payload;
+          try {
+            payload = Payload.fromBytes(data);
+          } catch (_) {
+            await rejectUnreadable(data, respond);
+            return null;
+          }
+          if (payload is ErrorReportPayload) {
+            showDisplay(
+              null,
+              .done,
+              DisplayResult(
+                mode: .error,
+                errorMode: DisplayErrorMode.fromInt(payload.errorCode.value),
+                failureMode: null,
+              ),
+            );
+            abort("Bluetooth negotiation failed due to error report.");
+            return null;
+          }
+          return payload;
+        }
+
+        // MARK: Server Runtime (after handshake)
+        Future<void> onServerRequest(
+          Uint8List data,
+          Future<void> Function(Uint8List) respond,
+          Object? central,
+        ) async {
+          if (finished || serverDone.isCompleted) return;
+          try {
+            final event = await readIncoming(data, respond);
+            if (event == null) return;
+
+            if (event is KeyExchangePayload) {
+              pgpPublicKeyOther = await decrypt(event.publicPgpKey);
+              await executeForPagesOfContent(
+                await encrypt(pgpPublicKey),
+                (page, pageIndex, pageCount) => respond(
+                  KeyExchangePayload(
+                    requestId: event.requestId,
+                    publicPgpKey: page,
+                    pageIndex: pageIndex,
+                    pages: pageCount,
+                  ).toBytes(),
+                ),
+              );
+            } else if (event is SignatureExchangePayload) {
+              final publicKeyOther = pgpPublicKeyOther;
+              if (publicKeyOther == null) {
+                await rejectUnreadable(data, respond);
+                return;
+              }
+              final signatureOther = await decrypt(event.detachedSignature);
+
+              final fingerprintA = _primaryPublicKeyPacket(pgpPublicKey);
+              final fingerprintB = _primaryPublicKeyPacket(publicKeyOther);
+              final transcript = _formatTranscript(
+                sessionId: activeSessionId,
+                nonceA: base64Encode(nonce),
+                nonceB: base64Encode(nonceOther!),
+                ephemeralA: base64Encode(ephemeralPublicKey.bytes),
+                ephemeralB: base64Encode(ephemeralPublicKeyOther!),
+                fingerprintA: base64Encode(fingerprintA.fingerprint),
+                fingerprintB: base64Encode(fingerprintB.fingerprint),
+                capabilitiesA: Capabilities.fromMap(capabilities).toInt(),
+                capabilitiesB: Capabilities.fromMap(capabilitiesOther!).toInt(),
+                uwb: null, // TODO: cf. 1.3, PGPtouch definition; UWB is not yet specified
+              );
+
+              late final Uint8List signature;
+              try {
+                signature = await _signDetachedInIsolate(
+                  transcript,
+                  privateKey,
+                );
+              } catch (e) {
+                showFailure(.suppliedKeysFailed, additionalInfo: e);
+                abort("Supplied signature failed");
+                return;
+              }
+
+              await executeForPagesOfContent(
+                await encrypt(signature),
+                (page, pageIndex, pageCount) => respond(
+                  SignatureExchangePayload(
+                    requestId: event.requestId,
+                    detachedSignature: page,
+                    pageIndex: pageIndex,
+                    pages: pageCount,
+                  ).toBytes(),
+                ),
+              );
+              serverSignatureSent = true;
+
+              final verification = verifyTranscriptSignature(
+                transcript,
+                publicKeyOther,
+                signatureOther,
+              );
+              if (!verification.isVerified) {
+                showFailure(
+                  .signatureVerificationFailed,
+                  additionalInfo: verification.verificationError,
+                );
+                abort("Signature verification failed");
+                return;
+              }
+
+              showDisplay(
+                null,
+                .done,
+                DisplayResult(
+                  mode: .success,
+                  errorMode: null,
+                  failureMode: null,
+                  additionalInfo: (
+                    fingerprint: fingerprintB.fingerprint,
+                    pgpKey: publicKeyOther,
+                    userIds: verification.userIds.toSet(),
+                  ),
+                ),
+              );
+              if (!serverDone.isCompleted) serverDone.complete();
+            } else {
+              await rejectUnreadable(data, respond);
+            }
+          } catch (e) {
+            await reportUnreadable(data, respond);
+            showFailure(.misformattedMessage, additionalInfo: e);
+            abort("Bluetooth negotiation failed: $e");
+          }
+        }
+
+        // MARK: Server Runtime (handshake)
+        // Nothing here is authenticated yet, so everything that is not a
+        // plausible handshake of the NFC peer is dropped without consequences
+        // for the run; otherwise any BLE device in range could abort it.
+        Future<void> onHandshakeRequest(
+          Uint8List data,
+          Future<void> Function(Uint8List) respond,
+          Object? central,
+        ) async {
+          if (finished || claimedRole != null) return;
+          Uint8List? requestId;
+          Future<void> reject(PayloadType code) async {
+            final id = requestId;
+            if (id == null) return;
+            try {
+              await respond(
+                ErrorReportPayload(
+                  requestId: id,
+                  appErrorCode: _defaultAppErrorCode,
+                  errorCode: code,
+                ).toBytes(),
+              ).timeout(const Duration(seconds: 2));
+            } catch (_) {
+              // the other device may already be gone
+            }
+          }
+
+          try {
+            final Payload incoming;
+            try {
+              incoming = Payload.fromBytes(data);
+            } catch (_) {
+              return;
+            }
+            if (incoming is! HandshakePayload) return;
+            requestId = incoming.requestId;
+
+            if (!incoming.initializerMatchesProtocol()) {
+              await reject(.error.headerIncompatible);
+              return;
+            }
+            final expected = expectedPeer;
+            if (!nfcContact ||
+                (expected != null &&
+                    !_handshakeMatchesBootstrap(incoming, expected))) {
+              await reject(.error.unableToReadContent);
+              return;
+            }
+
+            final _SessionKeys keys;
+            try {
+              keys = await deriveSessionKeys(
+                false,
+                sessionId.toBytes(),
+                incoming.publicX25519Key,
+              );
+            } catch (_) {
+              await reject(.error.unableToReadContent);
+              return;
+            }
+
+            if (!claimRole(.serverSender)) {
+              keys.shared.destroy();
+              keys.send.destroy();
+              keys.receive.destroy();
+              return;
+            }
+            run.bluetoothReceiverState._bindCentral(central);
+            installSessionKeys(keys);
+            activeSessionId = sessionId.toFormattedString();
+            nonceOther = incoming.nonce;
+            ephemeralPublicKeyOther = incoming.publicX25519Key;
+            capabilitiesOther = incoming.capabilities;
+
+            run.bluetoothReceiverState._registerReadRequestHandler(
+              onServerRequest,
+            );
+            showDisplay(.serverSender, .holdOther, null);
+
+            await respond(
+              HandshakeResponsePayload(requestId: incoming.requestId).toBytes(),
+            );
+
+            // TODO: cf. 1.3, PGPtouch definition; UWB is not yet specified
+
+            if (!roleDecided.isCompleted) {
+              roleDecided.complete(ProtocolRole.serverSender);
+            }
+          } catch (e) {
+            if (claimedRole != ProtocolRole.serverSender) return;
+            showFailure(.connectionFailed, additionalInfo: e);
+            abort("Bluetooth negotiation failed: $e");
+          }
+        }
+
+        // MARK: NFC negotiation
+        Future<void> negotiateOverNfc() async {
+          try {
+            while (!roleDecided.isCompleted) {
+              final _NfcInbound event;
+              try {
+                event = await nfcEvents.next();
+                // just exit the loop if the events stream is closed
+                // ignore: avoid_catching_errors
+              } on StateError {
+                if (roleDecided.isCompleted || finished) return;
+                throw _ProtocolBreakException(
+                  "NFC negotiation failed due to closed events stream.",
+                );
+              }
+              final received = event.data;
+              final loopback = event.loopback;
+              if (claimedRole == ProtocolRole.serverSender) return;
+
+              final NfcBootstrap payload;
+              try {
+                payload = NfcBootstrap.fromBytes(received);
+              } catch (_) {
+                continue;
+              }
+
+              if (!payload.initializerMatchesImplementation()) {
+                if (loopback) continue;
+                showDisplay(
+                  null,
+                  .done,
+                  DisplayResult(
+                    mode: .failure,
+                    errorMode: null,
+                    failureMode: .initializerMismatch,
+                    additionalInfo: (
+                      expected: protocolInitializerDefaults.version,
+                      received: payload.protocolInitializerVersion,
+                    ),
+                  ),
+                );
+                throw _ProtocolBreakException(
+                  "NFC negotiation failed due to protocol initializer mismatch.",
+                );
+              }
+
+              final String peerSessionId;
+              try {
+                peerSessionId = UuidValue.fromByteList(payload.sessionId)
+                    .toFormattedString();
+              } catch (_) {
+                if (loopback) continue;
+                showFailure(.misformattedMessage);
+                throw _ProtocolBreakException(
+                  "NFC negotiation failed due to invalid session ID.",
+                );
+              }
+
+              if (nfcSenderAvailable) {
+                switch (decideRole(
+                  randomSelf: random,
+                  nonceSelf: nonce,
+                  randomOther: payload.random,
+                  nonceOther: payload.nonce,
+                )) {
+                  case RoleDecision.serverSender:
+                    expectedPeer = payload;
+                    showDisplay(.serverSender, .holdOther, null);
+                    await nfcEvents.cancel();
+                    await run.nfcReceiverState.dispose();
+                    return;
+                  case RoleDecision.undecidable:
+                    showFailure(.pureLuck);
+                    throw _ProtocolBreakException(
+                      "NFC negotiation failed due to random/nonce comparison. "
+                      "(Chances for this are 2^-264; extremely unlikely)",
+                    );
+                  case RoleDecision.clientReceiver:
+                    break;
+                }
+              }
+
+              final _SessionKeys keys;
+              try {
+                keys = await deriveSessionKeys(
+                  true,
+                  payload.sessionId,
+                  payload.publicX25519Key,
+                );
+              } catch (_) {
+                if (loopback) continue;
+                showFailure(.misformattedMessage);
+                throw _ProtocolBreakException(
+                  "NFC negotiation failed due to an invalid X25519 key.",
+                );
+              }
+
+              if (!claimRole(.clientReceiver)) {
+                keys.shared.destroy();
+                keys.send.destroy();
+                keys.receive.destroy();
+                return;
+              }
+              activeSessionId = peerSessionId;
+              showDisplay(.clientReceiver, .holdOther, null);
+
+              await nfcEvents.cancel();
+              await run.nfcReceiverState.dispose();
+
+              try {
+                run.bluetoothSenderState.resetConnectionLoss();
+                if (!await run.bluetoothSenderState.connect(activeSessionId)) {
+                  throw Exception();
+                }
+              } catch (_) {
+                showFailure(.connectionFailed);
+                throw _ProtocolBreakException(
+                  "NFC negotiation failed due to connection failure.",
+                );
+              }
+
+              nonceOther = payload.nonce;
+              ephemeralPublicKeyOther = payload.publicX25519Key;
+              capabilitiesOther = payload.capabilities;
+              installSessionKeys(keys);
+
+              if (!roleDecided.isCompleted) {
+                roleDecided.complete(ProtocolRole.clientReceiver);
+              }
+              return;
+            }
+          } catch (e) {
+            if (!roleDecided.isCompleted) roleDecided.completeError(e);
+          }
+        }
+
+        run.bluetoothReceiverState._registerReadRequestHandler(
+          onHandshakeRequest,
+        );
+        run.bluetoothReceiverState._registerConnectionLossHandler((reason) {
+          if (finished ||
+              claimedRole != ProtocolRole.serverSender ||
+              serverDone.isCompleted ||
+              serverSignatureSent) {
+            return;
+          }
+          showFailure(.connectionFailed);
+          abort("Bluetooth negotiation failed: $reason");
+        });
         await (run.bluetoothReceiverState..data = sessionId.toFormattedString())
             .start();
         if (nfcSenderAvailable) {
@@ -191,517 +807,111 @@ final class ProtocolManager {
         }
         await run.nfcReceiverState.start();
 
-        final roleCompleter = Completer();
-        final roleBluetoothReceiverCompleter = Completer<ProtocolRole>();
-        final bluetoothReceiver = Completer<void>();
+        // errors are routed to roleDecided inside
+        // ignore: unawaited_futures
+        negotiateOverNfc();
+        final role = await roleDecided.future;
 
-        run.bluetoothReceiverState._registerReadRequestHandler((
-          data,
-          sendResponseWriteRequest,
-        ) async {
-          if (roleCompleter.isCompleted) {
-            // just exit the loop if the role has already been determined
-            run.bluetoothReceiverState._unregisterReadRequestHandler();
-            if (roleBluetoothReceiverCompleter.isCompleted) return;
-            roleBluetoothReceiverCompleter.complete(ProtocolRole.serverSender);
-            return;
-          }
-          late final HandshakePayload event;
-          try {
-            final tmpEvent = Payload.fromBytes(data);
-            if (tmpEvent is ErrorReportPayload) {
-              // this can be considered to belong to the protocol
-              // ignore: invalid_use_of_protected_member
-              run.displayState.emit(
-                run.displayState.withChanges(
-                  null,
-                  .done,
-                  DisplayResult(
-                    mode: .error,
-                    errorMode: DisplayErrorMode.fromInt(
-                      tmpEvent.errorCode.value,
-                    ),
-                    failureMode: null,
-                  ),
-                ),
-              );
-              roleBluetoothReceiverCompleter.completeError(
-                _ProtocolBreakException(
-                  "Bluetooth negotiation failed due to error report.",
-                ),
-              );
-              return;
-            } else if (tmpEvent is HandshakePayload) {
-              event = tmpEvent;
-            } else {
-              throw Exception();
-            }
-          } catch (_) {
-            if (data.length >= 7) {
-              final tmpRequestId = data.sublist(4, 7);
-              if (tmpRequestId.toIntOrNull() != null) {
-                await sendResponseWriteRequest(
-                  ErrorReportPayload(
-                    requestId: tmpRequestId,
-                    appErrorCode: _defaultAppErrorCode,
-                    errorCode: .error.unableToReadContent,
-                  ).toBytes(),
-                );
-              }
-            }
-            // this can be considered to belong to the protocol
-            // ignore: invalid_use_of_protected_member
-            run.displayState.emit(
-              run.displayState.withChanges(
-                null,
-                .done,
-                DisplayResult(
-                  mode: .failure,
-                  errorMode: null,
-                  failureMode: .misformattedMessage,
-                ),
-              ),
-            );
-            roleBluetoothReceiverCompleter.completeError(
-              _ProtocolBreakException(
-                "Bluetooth negotiation failed due to unreadable content.",
-              ),
-            );
-            return;
-          }
-
-          if (!event.initializerMatchesProtocol()) {
-            await sendResponseWriteRequest(
-              ErrorReportPayload(
-                requestId: event.requestId,
-                appErrorCode: _defaultAppErrorCode,
-                errorCode: .error.headerIncompatible,
-              ).toBytes(),
-            );
-            // this can be considered to belong to the protocol
-            // ignore: invalid_use_of_protected_member
-            run.displayState.emit(
-              run.displayState.withChanges(
-                null,
-                .done,
-                DisplayResult(
-                  mode: .failure,
-                  errorMode: null,
-                  failureMode: .initializerMismatch,
-                ),
-              ),
-            );
-            roleBluetoothReceiverCompleter.completeError(
-              _ProtocolBreakException(
-                "Bluetooth negotiation failed due to initializer mismatch.",
-              ),
-            );
-            return;
-          }
-
-          nonceOther = event.nonce;
-          ephemeralPublicKeyOther = event.publicX25519Key;
-          capabilitiesOther = event.capabilities;
-          await finalizeSharedKeys(false, sessionId.toBytes());
-
-          run.bluetoothReceiverState._registerReadRequestHandler((
-            data,
-            sendResponseWriteRequest,
-          ) async {
-            if (bluetoothReceiver.isCompleted) {
-              // just exit the loop if the role has already been determined
-              run.bluetoothReceiverState._unregisterReadRequestHandler();
-              return;
-            }
-            late Payload event;
-            try {
-              event = Payload.fromBytes(data);
-              if (event is ErrorReportPayload) {
-                // this can be considered to belong to the protocol
-                // ignore: invalid_use_of_protected_member
-                run.displayState.emit(
-                  run.displayState.withChanges(
-                    run.displayState.lastEvent?.deviceRole.value,
-                    .done,
-                    DisplayResult(
-                      mode: .error,
-                      errorMode: DisplayErrorMode.fromInt(
-                        event.errorCode.value,
-                      ),
-                      failureMode: null,
-                    ),
-                  ),
-                );
-                bluetoothReceiver.completeError(
-                  _ProtocolBreakException(
-                    "Bluetooth negotiation failed due to error report.",
-                  ),
-                );
-                return;
-              }
-            } catch (_) {
-              if (data.length >= 7) {
-                final tmpRequestId = data.sublist(4, 7);
-                if (tmpRequestId.toIntOrNull() != null) {
-                  await sendResponseWriteRequest(
-                    ErrorReportPayload(
-                      requestId: tmpRequestId,
-                      appErrorCode: _defaultAppErrorCode,
-                      errorCode: .error.unableToReadContent,
-                    ).toBytes(),
-                  );
-                }
-              }
-              // this can be considered to belong to the protocol
-              // ignore: invalid_use_of_protected_member
-              run.displayState.emit(
-                run.displayState.withChanges(
-                  run.displayState.lastEvent?.deviceRole.value,
-                  .done,
-                  DisplayResult(
-                    mode: .failure,
-                    errorMode: null,
-                    failureMode: .misformattedMessage,
-                  ),
-                ),
-              );
-              bluetoothReceiver.completeError(
-                _ProtocolBreakException(
-                  "Bluetooth negotiation failed due to unreadable content.",
-                ),
-              );
-              return;
-            }
-
-            // MARK: Server Runtime
-            switch (event.runtimeType) {
-              case KeyExchangePayload:
-                final keyExchangePayload = event as KeyExchangePayload;
-                pgpPublicKeyOther = await decrypt(
-                  keyExchangePayload.publicPgpKey,
-                );
-                await executeForPagesOfContent(
-                  await encrypt(pgpPublicKey),
-                  (page, pageIndex, pageCount) => sendResponseWriteRequest(
-                    KeyExchangePayload(
-                      requestId: keyExchangePayload.requestId,
-                      publicPgpKey: page,
-                      pageIndex: pageIndex,
-                      pages: pageCount,
-                    ).toBytes(),
-                  ),
-                );
-              case SignatureExchangePayload:
-                final signatureExchangePayload =
-                    event as SignatureExchangePayload;
-                final signatureOther = await decrypt(
-                  signatureExchangePayload.detachedSignature,
-                );
-
-                final fingerprintA = _primaryPublicKeyPacket(pgpPublicKey);
-                final fingerprintB = _primaryPublicKeyPacket(
-                  pgpPublicKeyOther!,
-                );
-                final transcript = _formatTranscript(
-                  sessionId: activeSessionId,
-                  nonceA: base64Encode(nonce),
-                  nonceB: base64Encode(nonceOther!),
-                  ephemeralA: base64Encode(ephemeralPublicKey.bytes),
-                  ephemeralB: base64Encode(ephemeralPublicKeyOther!),
-                  fingerprintA: base64Encode(fingerprintA.fingerprint),
-                  fingerprintB: base64Encode(fingerprintB.fingerprint),
-                  capabilitiesA: Capabilities.fromMap(capabilities).toInt(),
-                  capabilitiesB: Capabilities.fromMap(capabilitiesOther!)
-                      .toInt(),
-                  uwb: null, // TODO: cf. 1.3, PGPtouch definition; UWB is not yet specified
-                );
-
-                late final Uint8List signature;
-                try {
-                  signature = OpenPGP.signDetachedCleartext(transcript, [
-                    privateKey,
-                  ]).packetList.encode();
-                } catch (e) {
-                  // this can be considered to belong to the protocol
-                  // ignore: invalid_use_of_protected_member
-                  run.displayState.emit(
-                    run.displayState.withChanges(
-                      run.displayState.lastEvent?.deviceRole.value,
-                      .done,
-                      DisplayResult(
-                        mode: .failure,
-                        errorMode: null,
-                        failureMode: .suppliedKeysFailed,
-                        additionalInfo: e,
-                      ),
-                    ),
-                  );
-                  bluetoothReceiver.completeError(
-                    _ProtocolBreakException("Supplied signature failed"),
-                  );
-                  return;
-                }
-
-                await executeForPagesOfContent(
-                  await encrypt(signature),
-                  (page, pageIndex, pageCount) => sendResponseWriteRequest(
-                    SignatureExchangePayload(
-                      requestId: signatureExchangePayload.requestId,
-                      detachedSignature: page,
-                      pageIndex: pageIndex,
-                      pages: pageCount,
-                    ).toBytes(),
-                  ),
-                );
-
-                final verification = verifyTranscriptSignature(
-                  transcript,
-                  pgpPublicKeyOther!,
-                  signatureOther,
-                );
-                if (!verification.isVerified) {
-                  // this can be considered to belong to the protocol
-                  // ignore: invalid_use_of_protected_member
-                  run.displayState.emit(
-                    run.displayState.withChanges(
-                      run.displayState.lastEvent?.deviceRole.value,
-                      .done,
-                      DisplayResult(
-                        mode: .failure,
-                        errorMode: null,
-                        failureMode: .signatureVerificationFailed,
-                        additionalInfo: verification.verificationError,
-                      ),
-                    ),
-                  );
-                  bluetoothReceiver.completeError(
-                    _ProtocolBreakException("Signature verification failed"),
-                  );
-                  return;
-                }
-
-                // this can be considered to belong to the protocol
-                // ignore: invalid_use_of_protected_member
-                run.displayState.emit(
-                  run.displayState.withChanges(
-                    run.displayState.lastEvent?.deviceRole.value,
-                    .done,
-                    DisplayResult(
-                      mode: .success,
-                      errorMode: null,
-                      failureMode: null,
-                      additionalInfo: (
-                        fingerprint: _primaryPublicKeyPacket(pgpPublicKeyOther!)
-                            .fingerprint,
-                        pgpKey: pgpPublicKeyOther!,
-                        userIds: verification.userIds.toSet(),
-                      ),
-                    ),
-                  ),
-                );
-                if (!bluetoothReceiver.isCompleted) {
-                  bluetoothReceiver.complete();
-                }
-              default:
-                // this can be considered to belong to the protocol
-                // ignore: invalid_use_of_protected_member
-                run.displayState.emit(
-                  run.displayState.withChanges(
-                    null,
-                    .done,
-                    DisplayResult(
-                      mode: .failure,
-                      errorMode: null,
-                      failureMode: .misformattedMessage,
-                    ),
-                  ),
-                );
-            }
-          });
-
-          // this can be considered to belong to the protocol
-          // ignore: invalid_use_of_protected_member
-          run.displayState.emit(
-            run.displayState.withChanges(null, .holdOther, null),
-          );
-
-          await sendResponseWriteRequest(
-            HandshakePayload(
-              requestId: event.requestId,
-              capabilities: capabilities,
-              nonce: Uint8List.fromList(List.filled(32, 0)),
-              publicX25519Key: Uint8List.fromList(List.filled(32, 0)),
-            ).toBytes(),
-          );
-
-          // TODO: cf. 1.3, PGPtouch definition; UWB is not yet specified
-
-          activeSessionId = sessionId.toFormattedString();
-          roleCompleter.complete();
-          roleBluetoothReceiverCompleter.complete(ProtocolRole.serverSender);
-        });
-
-        final role = await Future.any<ProtocolRole>([
-          roleBluetoothReceiverCompleter.future,
-          () async {
-            while (true) {
-              late final NfcReceiverEvent event;
-              try {
-                event = await run.nfcReceiverState.events.first;
-                // just exit the loop if the events stream is closed
-                // ignore: avoid_catching_errors
-              } on StateError {
-                throw _ProtocolBreakException(
-                  "NFC negotiation failed due to closed events stream.",
-                );
-              }
-              if (event.received == null) continue;
-              if (roleCompleter.isCompleted) {
-                // just exit the loop if the role has already been determined
-                return ProtocolRole.clientReceiver;
-              }
-              late final NfcBootstrap payload;
-              try {
-                payload = NfcBootstrap.fromBytes(event.received!);
-              } catch (_) {
-                continue;
-              }
-
-              try {
-                activeSessionId = UuidValue.fromByteList(payload.sessionId)
-                    .toFormattedString();
-              } catch (_) {
-                // this can be considered to belong to the protocol
-                // ignore: invalid_use_of_protected_member
-                run.displayState.emit(
-                  run.displayState.withChanges(
-                    null,
-                    .done,
-                    DisplayResult(
-                      mode: .failure,
-                      errorMode: null,
-                      failureMode: .misformattedMessage,
-                    ),
-                  ),
-                );
-                throw _ProtocolBreakException(
-                  "NFC negotiation failed due to invalid session ID.",
-                );
-              }
-              try {
-                if (!(await run.bluetoothSenderState.connect(
-                  activeSessionId,
-                ))) {
-                  throw Exception();
-                }
-              } catch (_) {
-                // this can be considered to belong to the protocol
-                // ignore: invalid_use_of_protected_member
-                run.displayState.emit(
-                  run.displayState.withChanges(
-                    null,
-                    .done,
-                    DisplayResult(
-                      mode: .failure,
-                      errorMode: null,
-                      failureMode: .connectionFailed,
-                    ),
-                  ),
-                );
-                throw _ProtocolBreakException(
-                  "NFC negotiation failed due to connection failure.",
-                );
-              }
-
-              // this can be considered to belong to the protocol
-              // ignore: invalid_use_of_protected_member
-              run.displayState.emit(
-                run.displayState.withChanges(null, .holdOther, null),
-              );
-
-              if (!payload.initializerMatchesImplementation()) {
-                // this can be considered to belong to the protocol
-                // ignore: invalid_use_of_protected_member
-                run.displayState.emit(
-                  run.displayState.withChanges(
-                    null,
-                    .done,
-                    DisplayResult(
-                      mode: .failure,
-                      errorMode: null,
-                      failureMode: .initializerMismatch,
-                      additionalInfo: (
-                        expected: protocolInitializerDefaults.version,
-                        received: payload.protocolInitializerVersion,
-                      ),
-                    ),
-                  ),
-                );
-                throw _ProtocolBreakException(
-                  "NFC negotiation failed due to protocol initializer mismatch.",
-                );
-              }
-
-              if (nfcSenderAvailable) {
-                if (random > payload.random) {
-                  // cf. 1.1.3, PGPtouch definition
-                  continue;
-                } else if (random == payload.random &&
-                    nonce.toBigInt() > payload.nonce.toBigInt()) {
-                  // this can be considered to belong to the protocol
-                  // ignore: invalid_use_of_protected_member
-                  run.displayState.emit(
-                    run.displayState.withChanges(
-                      null,
-                      .done,
-                      DisplayResult(
-                        mode: .failure,
-                        errorMode: null,
-                        failureMode: .pureLuck,
-                      ),
-                    ),
-                  );
-                  throw _ProtocolBreakException(
-                    "NFC negotiation failed due to random/nonce comparison. "
-                    "(Chances for this are 2^-264; extremely unlikely)",
-                  );
-                }
-              }
-
-              nonceOther = payload.nonce;
-              ephemeralPublicKeyOther = payload.publicX25519Key;
-              capabilitiesOther = payload.capabilities;
-              await finalizeSharedKeys(true, payload.sessionId);
-
-              if (!roleCompleter.isCompleted) roleCompleter.complete();
-              return ProtocolRole.clientReceiver;
-            }
-          }(),
-        ]).catchError(Error.throwWithStackTrace);
-
-        // this can be considered to belong to the protocol
-        // ignore: invalid_use_of_protected_member
-        run.displayState.emit(
-          run.displayState.withChanges(role, .holdOther, null),
-        );
-
+        await nfcEvents.cancel();
         await run.nfcSenderState.dispose();
         await run.nfcReceiverState.dispose();
         if (role == ProtocolRole.clientReceiver) {
           // MARK: Client Runtime
-          bluetoothReceiver.complete();
+          if (!serverDone.isCompleted) serverDone.complete();
+          run.bluetoothReceiverState._unregisterReadRequestHandler();
           await run.bluetoothReceiverState.dispose();
 
+          void ensureActive() {
+            if (finished) {
+              throw _ProtocolBreakException("Protocol run already finished.");
+            }
+          }
+
+          Future<void> reportError(PayloadType code) async {
+            try {
+              await run.bluetoothSenderState
+                  .send(
+                    ErrorReportPayload(
+                      requestId: newRequestId(),
+                      appErrorCode: _defaultAppErrorCode,
+                      errorCode: code,
+                    ).toBytes(),
+                  )
+                  .timeout(const Duration(seconds: 2));
+            } catch (_) {
+              // the other device may already be gone
+            }
+          }
+
+          Future<T> receiveResponse<T extends Payload>(
+            Uint8List requestId,
+            String stage,
+          ) async {
+            final raw = await run.bluetoothSenderState.receiveRequestIdResponse(
+              requestId.toInt(),
+            );
+            ensureActive();
+            final Payload response;
+            try {
+              response = Payload.fromBytes(raw);
+            } catch (_) {
+              showFailure(.misformattedMessage);
+              await reportError(.error.unableToReadContent);
+              throw _ProtocolBreakException(
+                "Bluetooth $stage failed due to misformatted message.",
+              );
+            }
+            if (response is ErrorReportPayload) {
+              showDisplay(
+                null,
+                .done,
+                DisplayResult(
+                  mode: .error,
+                  errorMode: DisplayErrorMode.fromInt(response.errorCode.value),
+                  failureMode: null,
+                ),
+              );
+              throw _ProtocolBreakException(
+                "Bluetooth $stage failed due to error report.",
+              );
+            }
+            if (response is! T) {
+              showFailure(.misformattedMessage);
+              await reportError(.error.unableToReadContent);
+              throw _ProtocolBreakException(
+                "Bluetooth $stage failed due to unexpected message.",
+              );
+            }
+            return response;
+          }
+
+          Future<Uint8List> decryptOrFail(Uint8List transmitted) async {
+            try {
+              return await decrypt(transmitted);
+            } catch (_) {
+              showFailure(.misformattedMessage);
+              await reportError(.error.unableToReadContent);
+              throw _ProtocolBreakException(
+                "Bluetooth message could not be decrypted.",
+              );
+            }
+          }
+
+          final handshakeRequestId = newRequestId();
           await run.bluetoothSenderState.send(
             HandshakePayload(
-              requestId: rng.nextByte(3),
+              requestId: handshakeRequestId,
               capabilities: capabilities,
               nonce: nonce,
               publicX25519Key: Uint8List.fromList(ephemeralPublicKey.bytes),
             ).toBytes(),
           );
+          await receiveResponse<HandshakeResponsePayload>(
+            handshakeRequestId,
+            "handshake",
+          );
 
-          final keyExchangeRequestId = rng.nextByte(3);
+          final keyExchangeRequestId = newRequestId();
           await executeForPagesOfContent(
             await encrypt(pgpPublicKey),
             (page, pageIndex, pageCount) async =>
@@ -714,32 +924,13 @@ final class ProtocolManager {
                   ).toBytes(),
                 ),
           );
-          late final KeyExchangePayload keyExchangeResponse;
-          try {
-            keyExchangeResponse = Payload.fromBytes(
-              await run.bluetoothSenderState.receiveRequestIdResponse(
-                keyExchangeRequestId.toInt(),
-              ),
-            ) as KeyExchangePayload;
-          } catch (_) {
-            // this can be considered to belong to the protocol
-            // ignore: invalid_use_of_protected_member
-            run.displayState.emit(
-              run.displayState.withChanges(
-                role,
-                .done,
-                DisplayResult(
-                  mode: .failure,
-                  errorMode: null,
-                  failureMode: .misformattedMessage,
-                ),
-              ),
-            );
-            throw _ProtocolBreakException(
-              "Bluetooth key exchange failed due to misformatted message.",
-            );
-          }
-          pgpPublicKeyOther = await decrypt(keyExchangeResponse.publicPgpKey);
+          final keyExchangeResponse = await receiveResponse<KeyExchangePayload>(
+            keyExchangeRequestId,
+            "key exchange",
+          );
+          pgpPublicKeyOther = await decryptOrFail(
+            keyExchangeResponse.publicPgpKey,
+          );
 
           final fingerprintA = _primaryPublicKeyPacket(pgpPublicKeyOther!);
           final fingerprintB = _primaryPublicKeyPacket(pgpPublicKey);
@@ -757,29 +948,14 @@ final class ProtocolManager {
           );
           final signature = await () async {
             try {
-              return OpenPGP.signDetachedCleartext(transcript, [
-                privateKey,
-              ]).packetList.encode();
+              return await _signDetachedInIsolate(transcript, privateKey);
             } catch (e) {
-              // this can be considered to belong to the protocol
-              // ignore: invalid_use_of_protected_member
-              run.displayState.emit(
-                run.displayState.withChanges(
-                  role,
-                  .done,
-                  DisplayResult(
-                    mode: .failure,
-                    errorMode: null,
-                    failureMode: .suppliedKeysFailed,
-                    additionalInfo: e,
-                  ),
-                ),
-              );
+              showFailure(.suppliedKeysFailed, additionalInfo: e);
               throw _ProtocolBreakException("Supplied signature failed");
             }
           }();
 
-          final signatureExchangeRequestId = rng.nextByte(3);
+          final signatureExchangeRequestId = newRequestId();
           await executeForPagesOfContent(
             await encrypt(signature),
             (page, pageIndex, pageCount) async =>
@@ -792,110 +968,73 @@ final class ProtocolManager {
                   ).toBytes(),
                 ),
           );
-          late final SignatureExchangePayload signatureExchangeResponse;
-          try {
-            signatureExchangeResponse = Payload.fromBytes(
-              await run.bluetoothSenderState.receiveRequestIdResponse(
-                signatureExchangeRequestId.toInt(),
-              ),
-            ) as SignatureExchangePayload;
-          } catch (_) {
-            // this can be considered to belong to the protocol
-            // ignore: invalid_use_of_protected_member
-            run.displayState.emit(
-              run.displayState.withChanges(
-                role,
-                .done,
-                DisplayResult(
-                  mode: .failure,
-                  errorMode: null,
-                  failureMode: .misformattedMessage,
-                ),
-              ),
-            );
-            throw _ProtocolBreakException(
-              "Bluetooth signature exchange failed due to misformatted message.",
-            );
-          }
+          final signatureExchangeResponse =
+              await receiveResponse<SignatureExchangePayload>(
+                signatureExchangeRequestId,
+                "signature exchange",
+              );
 
           final verification = verifyTranscriptSignature(
             transcript,
             pgpPublicKeyOther!,
-            await decrypt(signatureExchangeResponse.detachedSignature),
+            await decryptOrFail(signatureExchangeResponse.detachedSignature),
           );
           if (!verification.isVerified) {
-            // this can be considered to belong to the protocol
-            // ignore: invalid_use_of_protected_member
-            run.displayState.emit(
-              run.displayState.withChanges(
-                role,
-                .done,
-                DisplayResult(
-                  mode: .failure,
-                  errorMode: null,
-                  failureMode: .signatureVerificationFailed,
-                  additionalInfo: verification.verificationError,
-                ),
-              ),
+            showFailure(
+              .signatureVerificationFailed,
+              additionalInfo: verification.verificationError,
             );
+            await reportError(.error.unableToReadContent);
             throw _ProtocolBreakException(
               "Bluetooth signature verification failed.",
             );
           }
 
-          // this can be considered to belong to the protocol
-          // ignore: invalid_use_of_protected_member
-          run.displayState.emit(
-            run.displayState.withChanges(
-              role,
-              .done,
-              DisplayResult(
-                mode: .success,
-                errorMode: null,
-                failureMode: null,
-                additionalInfo: (
-                  fingerprint: _primaryPublicKeyPacket(pgpPublicKeyOther!)
-                      .fingerprint,
-                  pgpKey: pgpPublicKeyOther!,
-                  userIds: verification.userIds.toSet(),
-                ),
+          showDisplay(
+            null,
+            .done,
+            DisplayResult(
+              mode: .success,
+              errorMode: null,
+              failureMode: null,
+              additionalInfo: (
+                fingerprint: fingerprintA.fingerprint,
+                pgpKey: pgpPublicKeyOther!,
+                userIds: verification.userIds.toSet(),
               ),
             ),
           );
         } else if (role == ProtocolRole.serverSender) {
           await run.bluetoothSenderState.dispose();
-          await bluetoothReceiver.future.catchError(Error.throwWithStackTrace);
+          await serverDone.future;
           // behavior defined above
         }
       }
 
-      await runtime()
-          .catchError(Error.throwWithStackTrace)
-          .timeout(
-            const Duration(seconds: 20),
-            onTimeout: () {
-              // this can be considered to belong to the protocol
-              // ignore: invalid_use_of_protected_member
-              run.displayState.emit(
-                run.displayState.withChanges(
-                  null,
-                  .done,
-                  DisplayResult(
-                    mode: .failure,
-                    errorMode: null,
-                    failureMode: .connectionFailed,
-                  ),
-                ),
-              );
-              throw _ProtocolBreakException(
-                "Protocol run timed out after 20 seconds.",
-              );
-            },
+      await runtime().timeout(
+        const Duration(seconds: 20),
+        onTimeout: () {
+          showFailure(.timeout);
+          throw _ProtocolBreakException(
+            "Protocol run timed out after 20 seconds.",
           );
+        },
+      );
     } on _ProtocolBreakException catch (_) {
-      // The error should've been handled by a previous DisplayState update
+      // error should've been handled by a previous DisplayState update
+    } catch (e) {
+      // e.g. the Bluetooth connection dropping because the devices were moved
+      // apart too early; must never leave the display in a pending state. the
+      // error is handed to the app through DisplayResult.additionalInfo.
+      showFailure(.connectionFailed, additionalInfo: e);
     } finally {
-      pgpPrivateKey.destroy();
+      finished = true;
+      run.bluetoothReceiverState._unregisterReadRequestHandler();
+      run.bluetoothReceiverState._unregisterConnectionLossHandler();
+      await nfcEvents.cancel();
+      for (final subscription in nfcContactSubscriptions) {
+        await subscription.cancel();
+      }
 
       nonce.destroy();
       ephemeralKeyPair.destroy();
@@ -908,6 +1047,13 @@ final class ProtocolManager {
 
       await run.nfcSenderState.dispose();
       await run.nfcReceiverState.dispose();
+      try {
+        if (await run.bluetoothSenderState.isConnected()) {
+          await run.bluetoothSenderState.disconnect();
+        }
+      } catch (_) {
+        // best-effort; the connection might already be gone
+      }
       await run.bluetoothSenderState.dispose();
       await run.bluetoothReceiverState.dispose();
     }
@@ -993,6 +1139,25 @@ final class ProtocolRun {
 }
 
 final class DisplayState extends CommonState<DisplayState, DisplayEvent> {
+  bool _disposed = false;
+
+  @override
+  @protected
+  void emit(DisplayEvent event) {
+    if (_disposed) return;
+    final isDone = lastEvent?.contactMode.value == DisplayContactMode.done;
+    if (isDone && event.contactMode.value != DisplayContactMode.initializing) {
+      return;
+    }
+    super.emit(event);
+  }
+
+  @override
+  Future<void> dispose() {
+    _disposed = true;
+    return super.dispose();
+  }
+
   DisplayEvent withChanges(
     ProtocolRole? deviceRole,
     DisplayContactMode contactMode,
@@ -1000,9 +1165,9 @@ final class DisplayState extends CommonState<DisplayState, DisplayEvent> {
   ) =>
       lastEvent?.withChanges(deviceRole, contactMode, result) ??
       DisplayEvent(
-        deviceRole: ValueChangedContainer._fromLast(deviceRole, null),
-        contactMode: ValueChangedContainer._fromLast(contactMode, null),
-        result: ValueChangedContainer._fromLast(result, null),
+        deviceRole: ValueChangedContainer._initial(deviceRole),
+        contactMode: ValueChangedContainer._initial(contactMode),
+        result: ValueChangedContainer._initial(result),
       );
 }
 
@@ -1106,7 +1271,7 @@ enum DisplayFailureMode {
   ///
   /// In this case, the protocol is unable to determine the correct roles, thus
   /// the run has to be cancelled. The chances for this are extremely low,
-  /// 2^-264 to be exact.
+  /// $2^-264$ to be exact.
   pureLuck,
 
   /// The connection attempt to the other device has failed.
@@ -1129,6 +1294,13 @@ enum DisplayFailureMode {
   /// If this is set, [DisplayResult.additionalInfo] may contain additional
   /// information about the issue.
   signatureVerificationFailed,
+
+  /// The protocol run did not complete within the allotted time.
+  ///
+  /// Unlike [connectionFailed], this doesn't necessarily indicate a network or
+  /// hardware issue; it means the overall run simply took too long, e.g.
+  /// because one of the devices stalled somewhere along the way.
+  timeout,
 }
 
 final class DisplayResult {
@@ -1154,10 +1326,12 @@ final class ValueChangedContainer<E extends Object?> {
   final bool hasChanged;
 
   ValueChangedContainer._({required this.value, required this.hasChanged});
+  ValueChangedContainer._initial(E value)
+    : this._(value: value, hasChanged: true);
   factory ValueChangedContainer._fromLast(E value, E? lastValue) {
     return ValueChangedContainer._(
       value: value,
-      hasChanged: lastValue == null || value != lastValue,
+      hasChanged: value != lastValue,
     );
   }
 }
@@ -1171,7 +1345,16 @@ abstract base class NfcSenderState
         CommonStateWithData<NfcSenderState, NfcSenderEvent, NfcBootstrap>,
         CommonStateWithAvailabilityCheck<NfcSenderState, NfcSenderEvent> {}
 
-final class NfcSenderEvent extends Event<NfcSenderState> {}
+final class NfcSenderEvent extends Event<NfcSenderState> {
+  /// A bootstrap the other device pushed to this one.
+  final Uint8List? received;
+  NfcSenderEvent({this.received});
+
+  /// This device's card was selected by a reader, i.e. a physical contact
+  /// happened. Implementations must emit this on every select; the protocol
+  /// manager only accepts a BLE handshake after any NFC activity.
+  NfcSenderEvent.selected() : received = null;
+}
 
 abstract base class NfcReceiverState
     extends CommonState<NfcReceiverState, NfcReceiverEvent>
@@ -1206,9 +1389,43 @@ abstract base class BluetoothSenderState
 
   final _pageBuffer = <int, List<Payload?>>{};
   final _responseCompleters = <int, Completer<Uint8List>>{};
+  final _pageTimers = <int, Timer>{};
+
+  /// How long to wait for the next page of a multi-page response.
+  ///
+  /// If this timeout is reached, the response gets dropped and reported to the
+  /// remote device with [ErrorPayloadType.pageTimeout].
+  @protected
+  Duration get pageTimeout => defaultPageTimeout;
 
   Completer<Uint8List> _completerFor(int requestId) =>
       _responseCompleters.putIfAbsent(requestId, Completer<Uint8List>.new);
+
+  void _armPageTimeout(int requestId) {
+    _pageTimers[requestId]?.cancel();
+    _pageTimers[requestId] = Timer(pageTimeout, () async {
+      _pageTimers.remove(requestId);
+      _pageBuffer.remove(requestId);
+      final completer = _completerFor(requestId);
+      if (!completer.isCompleted) {
+        completer.future.ignore();
+        completer.completeError(
+          TimeoutException("Next page of a response not received in time."),
+        );
+      }
+      try {
+        await send(
+          ErrorReportPayload(
+            requestId: requestId.toNBytes(3),
+            appErrorCode: _defaultAppErrorCode,
+            errorCode: .error.pageTimeout,
+          ).toBytes(),
+        );
+      } catch (_) {
+        // the other device may already be gone
+      }
+    });
+  }
 
   /// Handles a notification received from the remote Bluetooth device on
   /// [bleCharacteristicResponse].
@@ -1220,7 +1437,12 @@ abstract base class BluetoothSenderState
   @protected
   Future<void> notificationHandler(Uint8List data) async {
     final entry = protocolStatesMultiPageHandler(_pageBuffer, data).entries;
-    if (entry.isEmpty || !entry.first.value) return;
+    if (entry.isEmpty) return;
+    if (!entry.first.value) {
+      _armPageTimeout(entry.first.key);
+      return;
+    }
+    _pageTimers.remove(entry.first.key)?.cancel();
     final pages = _pageBuffer.remove(entry.first.key)!.map((e) => e!.toBytes());
 
     final stitchedData = Uint8List.fromList([
@@ -1230,18 +1452,74 @@ abstract base class BluetoothSenderState
     final stitchedDataContentLength = (stitchedData.length - 12).toNBytes(2);
     stitchedData.setRange(10, 12, stitchedDataContentLength);
 
-    _completerFor(entry.first.key).complete(stitchedData);
+    final completer = _completerFor(entry.first.key);
+    if (!completer.isCompleted) completer.complete(stitchedData);
   }
 
   /// Receives a response for the given request ID.
   ///
   /// Waits for the response corresponding to the given request ID, which is
   /// reassembled across pages by [notificationHandler] if necessary.
+  ///
+  /// Throws a [StateError] if this state is disposed or the connection is lost
+  /// (see [peripheralDisconnected]) while waiting.
   @nonVirtual
   Future<Uint8List> receiveRequestIdResponse(int requestId) async {
-    final future = await _completerFor(requestId).future;
-    _responseCompleters.remove(requestId);
-    return future;
+    final completer = _completerFor(requestId);
+    if (_connectionLost && !completer.isCompleted) _failConnectionLost();
+    try {
+      return await completer.future;
+    } finally {
+      _responseCompleters.remove(requestId);
+    }
+  }
+
+  bool _connectionLost = false;
+
+  /// Called by the protocol manager before connecting; a new connection starts
+  /// without a loss.
+  @nonVirtual
+  @visibleForTesting
+  void resetConnectionLoss() => _connectionLost = false;
+
+  void _failConnectionLost() {
+    for (final completer in _responseCompleters.values) {
+      if (completer.isCompleted) continue;
+      completer.future.ignore();
+      completer.completeError(
+        StateError("The other device disconnected before a response arrived."),
+      );
+    }
+  }
+
+  /// Must be called when the remote Bluetooth device (the server) disconnects
+  /// or the connection is lost.
+  ///
+  /// Responses that are still awaited fail right away instead of running into
+  /// the timeout of the whole run. Responses that already arrived stay valid.
+  @protected
+  void peripheralDisconnected() {
+    _connectionLost = true;
+    _failConnectionLost();
+  }
+
+  @override
+  Future<void> dispose() async {
+    final pending = _responseCompleters.values.toList();
+    _responseCompleters.clear();
+    _pageBuffer.clear();
+    for (final timer in _pageTimers.values) {
+      timer.cancel();
+    }
+    _pageTimers.clear();
+    for (final completer in pending) {
+      if (completer.isCompleted) continue;
+      completer.future.ignore();
+      completer.completeError(
+        StateError("Bluetooth sender disposed before a response arrived."),
+      );
+    }
+    await super.dispose();
   }
 }
 
@@ -1250,6 +1528,7 @@ final class BluetoothSenderEvent extends Event<BluetoothSenderState> {}
 typedef BluetoothReceiverReadRequestHandler = FutureOr<void> Function(
   Uint8List data,
   Future<void> Function(Uint8List) sendResponseWriteRequest,
+  Object? central,
 );
 
 /// The state class for the Bluetooth receiver.
@@ -1280,7 +1559,88 @@ abstract base class BluetoothReceiverState
   @nonVirtual
   void _unregisterReadRequestHandler() => _readRequestHandler = null;
 
+  void Function(String reason)? _connectionLossHandler;
+  @nonVirtual
+  void _registerConnectionLossHandler(void Function(String reason) handler) =>
+      _connectionLossHandler = handler;
+  @nonVirtual
+  void _unregisterConnectionLossHandler() => _connectionLossHandler = null;
+
+  bool _centralBound = false;
+  Object? _boundCentral;
+
+  /// Once the protocol manager accepted a handshake, only this central may
+  /// talk to it; requests and disconnects of other centrals are ignored.
+  @nonVirtual
+  void _bindCentral(Object? central) {
+    _centralBound = true;
+    _boundCentral = central;
+  }
+
+  bool _isForeignCentral(Object? central) =>
+      _centralBound && central != _boundCentral;
+
   final _pageBuffer = <int, List<Payload?>>{};
+  final _pageTimers = <int, Timer>{};
+
+  /// How long to wait for the next page of a multi-page request.
+  ///
+  /// If this timeout is reached, the request gets dropped and reported to the
+  /// remote device with [ErrorPayloadType.pageTimeout].
+  @protected
+  Duration get pageTimeout => defaultPageTimeout;
+
+  /// Must be called when the remote Bluetooth device (the client) disconnects.
+  ///
+  /// This lets an unfinished run fail right away instead of waiting for a
+  /// request that will never arrive. Pass the identifier of the disconnected
+  /// [central] (the same one given to [readRequestHandler]) so that the
+  /// disconnect of an unrelated device is not mistaken for the loss of the
+  /// client.
+  @protected
+  void centralDisconnected({Object? central}) {
+    if (_isForeignCentral(central)) return;
+    _connectionLossHandler?.call("The other device disconnected.");
+  }
+
+  void _armPageTimeout(
+    int requestId,
+    Future<void> Function(Uint8List) sendResponseWriteRequest,
+  ) {
+    _pageTimers[requestId]?.cancel();
+    _pageTimers[requestId] = Timer(pageTimeout, () async {
+      _pageTimers.remove(requestId);
+      _pageBuffer.remove(requestId);
+      try {
+        await sendResponseWriteRequest(
+          ErrorReportPayload(
+            requestId: requestId.toNBytes(3),
+            appErrorCode: _defaultAppErrorCode,
+            errorCode: .error.pageTimeout,
+          ).toBytes(),
+        );
+      } catch (_) {
+        // the other device may already be gone
+      }
+      _connectionLossHandler?.call(
+        "Next page of a request not received in time.",
+      );
+    });
+  }
+
+  @override
+  Future<void> dispose() async {
+    _readRequestHandler = null;
+    _connectionLossHandler = null;
+    _centralBound = false;
+    _boundCentral = null;
+    _pageBuffer.clear();
+    for (final timer in _pageTimers.values) {
+      timer.cancel();
+    }
+    _pageTimers.clear();
+    await super.dispose();
+  }
 
   /// Handles a read request from the remote Bluetooth device.
   ///
@@ -1291,29 +1651,44 @@ abstract base class BluetoothReceiverState
   /// [sendResponseWriteRequest] should send a new read request to the remote
   /// Bluetooth device with the passed data.
   ///
+  /// [central] identifies the sending remote device, if the platform can tell
+  /// devices apart. Once the protocol manager bound itself to a central, any
+  /// other one is ignored.
+  ///
   /// Unterstützung für mehrseitige Protokoll-Requests ist eingebaut.
   @protected
   Future<void> readRequestHandler(
     Uint8List data,
-    Future<void> Function(Uint8List) sendResponseWriteRequest,
-  ) async {
+    Future<void> Function(Uint8List) sendResponseWriteRequest, {
+    Object? central,
+  }) async {
+    if (_isForeignCentral(central)) return;
     final entry = protocolStatesMultiPageHandler(_pageBuffer, data).entries;
     if (entry.isEmpty) return;
-    if (entry.first.value) {
-      final buffer = _pageBuffer[entry.first.key]!
-          .map((e) => e!.toBytes())
-          .toList();
-      final stitchedData = Uint8List.fromList([
-        ...buffer.first.take(12),
-        ...buffer.expand((e) => e.skip(12)),
-      ]);
-      final stitchedDataContentLength = (stitchedData.length - 12).toNBytes(2);
-      stitchedData.setRange(10, 12, stitchedDataContentLength);
-      await Future.value(
-        _readRequestHandler?.call(stitchedData, sendResponseWriteRequest),
-      );
-      _pageBuffer.remove(entry.first.key);
+    if (!entry.first.value) {
+      _armPageTimeout(entry.first.key, sendResponseWriteRequest);
+      return;
     }
+    _pageTimers.remove(entry.first.key)?.cancel();
+    final buffer = _pageBuffer
+        .remove(entry.first.key)!
+        .map((e) => e!.toBytes())
+        .toList();
+    final stitchedData = Uint8List.fromList([
+      ...buffer.first.take(12),
+      ...buffer.expand((e) => e.skip(12)),
+    ]);
+    final stitchedDataContentLength = (stitchedData.length - 12).toNBytes(2);
+    stitchedData.setRange(10, 12, stitchedDataContentLength);
+    // the buffer entry is released before the handler runs, so a failing
+    // handler can't leave stale pages behind for a retried request ID
+    await Future.value(
+      _readRequestHandler?.call(
+        stitchedData,
+        sendResponseWriteRequest,
+        central,
+      ),
+    );
   }
 }
 
@@ -1337,7 +1712,13 @@ Map<int, bool> protocolStatesMultiPageHandler(
   try {
     final payload = Payload.fromBytes(data);
     final requestId = payload.requestId.toInt();
-    if (!pageBuffer.containsKey(requestId)) {
+    final existing = pageBuffer[requestId];
+    if (existing != null && existing.length != payload.pages) {
+      // inconsistent page count; drop the corrupted request
+      pageBuffer.remove(requestId);
+      return {};
+    }
+    if (existing == null) {
       pageBuffer[requestId] = List.generate(
         payload.pages,
         (_) => null,
@@ -1364,7 +1745,6 @@ Future<void> executeForPagesOfContent(
   callback,
 ) async {
   final pageSize = 500;
-  // cf. 1.2, PGPtouch definition: the page count must be at least 1
   final pageCount = content.isEmpty ? 1 : (content.length / pageSize).ceil();
   for (var i = 0; i < pageCount; i++) {
     final chunk = content.sublist(
@@ -1375,9 +1755,35 @@ Future<void> executeForPagesOfContent(
   }
 }
 
+/// Checks if the handshake of the BLE client carries the values of the
+/// bootstrap that was exchanged over NFC.
+bool _handshakeMatchesBootstrap(
+  HandshakePayload handshake,
+  NfcBootstrap bootstrap,
+) =>
+    const ListEquality<int>().equals(handshake.nonce, bootstrap.nonce) &&
+    const ListEquality<int>().equals(
+      handshake.publicX25519Key,
+      bootstrap.publicX25519Key,
+    ) &&
+    Capabilities.fromMap(handshake.capabilities).toInt() ==
+        Capabilities.fromMap(bootstrap.capabilities).toInt();
+
 /// Checks if the given PGP private key is encrypted.
 bool isPrivateKeyEncrypted(Uint8List pgpPrivateKey) =>
     PrivateKey(PacketList.decode(pgpPrivateKey)).isEncrypted;
+
+Future<PrivateKey> _decryptPrivateKeyInIsolate(
+  PrivateKey key,
+  String passphrase,
+) => Isolate.run(() => key.decrypt(passphrase) as PrivateKey);
+
+Future<Uint8List> _signDetachedInIsolate(String transcript, PrivateKey key) =>
+    Isolate.run(
+      () => Uint8List.fromList(
+        OpenPGP.signDetachedCleartext(transcript, [key]).packetList.encode(),
+      ),
+    );
 
 PublicKeyPacket _primaryPublicKeyPacket(Uint8List framedPacketListBytes) =>
     PacketList.decode(framedPacketListBytes).packets
@@ -1421,6 +1827,14 @@ TranscriptVerification verifyTranscriptSignature(
   TranscriptVerification failure(String error) =>
       (isVerified: false, verificationError: error, userIds: userIds);
 
+  for (final id in userIds) {
+    try {
+      UserId.parse(id);
+    } catch (e) {
+      return failure(e.toString());
+    }
+  }
+
   final signature = PacketList.decode(signatureBytes).packets
       .whereType<SignaturePacket>()
       .where((packet) => bytesEqual(packet.issuerKeyID, keyPacket.keyID))
@@ -1450,7 +1864,6 @@ TranscriptVerification verifyTranscriptSignature(
     return failure('Assertion failed: "Signed digest did not match!"');
   }
 
-  // dart_pg doesn't export VerificationKeyMaterial, so call it dynamically
   final dynamic keyMaterial = keyPacket.keyMaterial;
   try {
     final isVerified = keyMaterial.verify(

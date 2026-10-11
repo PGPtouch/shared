@@ -3,10 +3,60 @@ import 'dart:typed_data';
 import 'package:dart_pg/dart_pg.dart' hide Uint8ListExt;
 import 'package:shared/src/packages.dart';
 import 'package:shared/src/protocol_manager.dart';
+import 'package:shared/src/user_id.dart';
 import 'package:test/test.dart';
 
 void main() {
   signatureTests();
+  test('user IDs are parsed in linear time', () {
+    final sw = Stopwatch()..start();
+    expect(UserId.tryParse(' ' * 100000), isNull);
+    expect(UserId.tryParse('a${' ' * 100000}('), isNull);
+    expect(sw.elapsedMilliseconds, lessThan(1000));
+    final parsed = UserId.parse('John Doe (Developer) <john@example.com>');
+    expect(parsed.name, 'John Doe');
+    expect(parsed.comment, 'Developer');
+    expect(parsed.email, 'john@example.com');
+    expect(UserId.parse('<a@b.c>').name, isNull);
+  });
+
+  test(
+    'unknown capability bits are kept and agree across both wire formats',
+    () {
+      final bits = {0: true, 1: true, 2: true, 40: true, 100: true};
+      final bootstrap = NfcBootstrap.fromBytes(
+        NfcBootstrap(
+          random: 1,
+          sessionId: Uint8List(16),
+          capabilities: {
+            for (final e in bits.entries)
+              if (e.key < 96) e.key: true,
+          },
+          nonce: Uint8List(32),
+          publicX25519Key: Uint8List(32),
+        ).toBytes(),
+      );
+      final handshake = HandshakePayload.fromBytes(
+        HandshakePayload(
+          requestId: Uint8List(3),
+          capabilities: bits,
+          nonce: Uint8List(32),
+          publicX25519Key: Uint8List(32),
+        ).toBytes(),
+      );
+
+      final viaBootstrap = Capabilities.fromMap(bootstrap.capabilities);
+      final viaHandshake = Capabilities.fromMap(handshake.capabilities);
+      expect(viaBootstrap.additional[40], isTrue);
+      expect(viaHandshake.additional[100], isTrue);
+      expect(
+        Capabilities.fromMap({0: true, 40: true, 150: false}).toInt(),
+        Capabilities.fromMap({0: true, 40: true}).toInt(),
+      );
+      expect(Capabilities.fromMap({40: true}).toInt(), 1 << 40);
+    },
+  );
+
   test('round-trips NfyBootstrap', () {
     final package = NfcBootstrap(
       random: 7,

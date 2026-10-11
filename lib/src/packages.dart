@@ -14,20 +14,31 @@ List<BytePackagePart> protocolInitializer([List<int>? id, int? version]) =>
       BytePackageInt(1, version ?? protocolInitializerDefaults.version),
     ]);
 
-final class Capabilities({
-  required final bool nfc,
-  required final bool bluetooth,
-  required final bool uwb,
-}) {
-  @override
-  String toString() =>
-      "Capabilities(nfc: $nfc, bluetooth: $bluetooth, uwb: $uwb)";
+final class Capabilities {
+  final bool nfc;
+  final bool bluetooth;
+  final bool uwb;
+  final Map<int, bool> additional;
 
-  Map<int, bool> toMap() => {0: nfc, 1: bluetooth, 2: uwb};
+  new({
+    required this.nfc,
+    required this.bluetooth,
+    required this.uwb,
+    this.additional = const {},
+  });
+
+  @override
+  String toString() {
+    final extra = additional.isEmpty ? "" : ", additional: $additional";
+    return "Capabilities(nfc: $nfc, bluetooth: $bluetooth, uwb: $uwb$extra)";
+  }
+
+  Map<int, bool> toMap() => {0: nfc, 1: bluetooth, 2: uwb, ...additional};
   factory fromMap(Map<int, bool> map) => Capabilities(
     nfc: map[0] ?? false,
     bluetooth: map[1] ?? false,
     uwb: map[2] ?? false,
+    additional: Map.fromEntries(map.entries.where((entry) => entry.key > 2)),
   );
 
   int toInt() => BytePackageBitFlags(null, toMap()).toBytes().toInt();
@@ -39,9 +50,13 @@ final class Capabilities({
           runtimeType == other.runtimeType &&
           nfc == other.nfc &&
           bluetooth == other.bluetooth &&
-          uwb == other.uwb;
+          uwb == other.uwb &&
+          _mapEquality.equals(additional, other.additional);
   @override
-  int get hashCode => Object.hash(nfc, bluetooth, uwb);
+  int get hashCode =>
+      Object.hash(nfc, bluetooth, uwb, _mapEquality.hash(additional));
+
+  static const _mapEquality = MapEquality();
 }
 
 final class NfcBootstrap extends BytePackage {
@@ -181,7 +196,10 @@ sealed class Payload extends BytePackage {
     if (errorCode != 0) return ErrorReportPayload.fromBytes(bytes);
     final payloadType = PayloadType(bytes[7]);
     return switch (payloadType) {
-      .handshake => HandshakePayload.fromBytes(bytes),
+      .handshake =>
+        bytes.length <= 12
+            ? HandshakeResponsePayload.fromBytes(bytes)
+            : HandshakePayload.fromBytes(bytes),
       .keyExchange => KeyExchangePayload.fromBytes(bytes),
       .signatureExchange => SignatureExchangePayload.fromBytes(bytes),
       _ => throw UnimplementedError(
@@ -303,6 +321,43 @@ final class HandshakePayload extends Payload {
         protocolInitializerDefaults.id,
       ) &&
       protocolInitializerVersion == protocolInitializerDefaults.version;
+}
+
+/// The server's answer to a [HandshakePayload].
+final class HandshakeResponsePayload extends Payload {
+  @override
+  String get className => "HandshakeResponsePayload";
+
+  HandshakeResponsePayload({required super.requestId})
+    : super(pageIndex: 1, pages: 1);
+
+  @override
+  List<BytePackagePart> get parts => _payloadHeaderParts(
+    errorCode: 0,
+    requestId: requestId,
+    payloadType: PayloadType.handshake,
+    pageIndex: pageIndex,
+    pages: pages,
+    length: 0,
+  );
+
+  static HandshakeResponsePayload fromBytes(Uint8List bytes) =>
+      BytePackage.fromBytes(
+        bytes,
+        _payloadHeaderParts(
+          errorCode: 0,
+          requestId: Uint8List(3),
+          payloadType: PayloadType.handshake,
+          pageIndex: 0,
+          pages: 0,
+          length: 0,
+        ),
+        (parts) => HandshakeResponsePayload(requestId: parts[3] as Uint8List),
+      );
+
+  @override
+  HandshakeResponsePayload copyWith() =>
+      HandshakeResponsePayload(requestId: requestId);
 }
 
 final class KeyExchangePayload extends Payload {

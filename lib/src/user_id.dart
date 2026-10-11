@@ -6,7 +6,9 @@ class UserId {
   UserId({this.name, this.comment, required this.email});
 
   factory UserId.parse(String userIdString) {
-    final regex = RegExp(r"^(.*?)\s*(?:\((.*?)\))?\s*<(.+?)>$");
+    final regex = RegExp(
+      r"^\s*(?:([^<(\s](?:[^<(]*[^<(\s])?)\s*)?(?:\(([^)]*)\)\s*)?<(.+)>$",
+    );
     final match = regex.firstMatch(userIdString);
     if (match == null) {
       throw ArgumentError.value(
@@ -15,8 +17,7 @@ class UserId {
         "Invalid user ID format",
       );
     }
-    final rawName = match.group(1)!;
-    final name = rawName.isEmpty ? null : rawName;
+    final name = match.group(1);
     final comment = match.group(2);
     final email = match.group(3)!;
     if (email.isEmpty) {
@@ -37,6 +38,16 @@ class UserId {
     }
   }
 
+  UserId copyWith({
+    ValuePresence<String?> name = const ValuePresence.absent(),
+    ValuePresence<String?> comment = const ValuePresence.absent(),
+    String? email,
+  }) => UserId(
+    name: name | this.name,
+    comment: comment | this.comment,
+    email: email ?? this.email,
+  );
+
   @override
   String toString() {
     final namePart = name ?? "";
@@ -56,6 +67,19 @@ class UserId {
   int get hashCode => Object.hash(name, comment, email);
 }
 
+final class ValuePresence<T extends Object?> {
+  final bool isPresent;
+  final T? value;
+
+  const new present(this.value) : isPresent = true;
+  const new absent() : isPresent = false, value = null;
+
+  T orElse(T Function() defaultValue) => isPresent ? value! : defaultValue();
+  T or(T defaultValue) => isPresent ? value! : defaultValue;
+
+  T operator |(T defaultValue) => or(defaultValue);
+}
+
 void main(List<String> args) {
   final userId1 = UserId.parse("John Doe (Developer) <john.doe@example.com>");
   print(userId1);
@@ -68,4 +92,7 @@ void main(List<String> args) {
 
   final userId4 = UserId(email: "anonymous@example.com");
   print(userId4);
+
+  final userId5 = UserId.tryParse("<another.user@example.com>");
+  print(userId5);
 }

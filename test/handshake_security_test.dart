@@ -68,8 +68,10 @@ void main() {
     // ignore: discarded_futures
     manager
         .start(
-          key.publicKey.packetList.encode(),
-          key.packetList.encode(),
+          LocalPgpProvider(
+            key.publicKey.packetList.encode(),
+            key.packetList.encode(),
+          ),
           privateKeyPassphrase: 'pw',
         )
         .ignore();

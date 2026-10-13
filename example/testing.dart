@@ -234,13 +234,11 @@ void main(List<String> args) async {
   await Future.wait(
     [
       deviceA.start(
-        pgpPublicKeyA,
-        pgpPrivateKeyA,
+        LocalPgpProvider(pgpPublicKeyA, pgpPrivateKeyA),
         privateKeyPassphrase: "passphraseA",
       ),
       deviceB.start(
-        pgpPublicKeyB,
-        pgpPrivateKeyB,
+        LocalPgpProvider(pgpPublicKeyB, pgpPrivateKeyB),
         privateKeyPassphrase: "passphraseB",
       ),
     ],

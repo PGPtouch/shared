@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:dart_pg/dart_pg.dart' hide Uint8ListExt;
@@ -150,7 +151,7 @@ void signatureTests() {
 
     Uint8List sign(String text, DateTime time, PrivateKey signer) =>
         Uint8List.fromList(
-          CleartextMessage(text)
+          OpenPGP.createLiteralMessage(Uint8List.fromList(utf8.encode(text)))
               .signDetached([signer], time: time)
               .packetList
               .encode(),

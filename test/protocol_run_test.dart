@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 import 'package:dart_pg/dart_pg.dart' hide Uint8ListExt;
 import 'package:shared/src/packages.dart';
+import 'package:shared/src/pgp_provider.dart';
 import 'package:shared/src/protocol_manager.dart';
 import 'package:test/test.dart';
 
@@ -427,8 +428,7 @@ void protocolRunTests() {
 
     Future<void> start(_Device device, String passphrase) =>
         device.manager.start(
-          device.publicKey,
-          device.privateKey,
+          LocalPgpProvider(device.publicKey, device.privateKey),
           privateKeyPassphrase: passphrase,
         );
 

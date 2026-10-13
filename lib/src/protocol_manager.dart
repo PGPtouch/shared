@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
-import 'dart:isolate';
 import 'dart:math';
 import 'dart:typed_data';
 
@@ -147,18 +146,19 @@ final class ProtocolManager {
   /// Closes the protocol manager and releases any associated resources.
   Future<void> close() async => await run.close();
 
-  /// Starts the protocol manager with the given PGP public and private keys.
+  /// Starts the protocol manager using the given [pgpProvider].
   ///
-  /// The keys are expected to be in the full framed OpenPGP packet-list format.
-  /// If the private key is passphrase-encrypted, [privateKeyPassphrase] must be
-  /// supplied to unlock it before it can be used for signing.
+  /// The public key returned by [PgpProvider.getPublicKey] is expected to be
+  /// in the full framed OpenPGP packet-list format. If the private key backing
+  /// [pgpProvider] is passphrase-encrypted, [privateKeyPassphrase] must be
+  /// supplied to unlock it before it can be used for signing; it is passed
+  /// through to [PgpProvider.signToDetached] whenever a signature is needed.
   ///
-  /// You may use [isPrivateKeyEncrypted] to check beforehand, or you wait for
-  /// the [ArgumentError] thrown by this method if the private key is encrypted
-  /// but no passphrase is provided.
+  /// You may use [PgpProvider.isPrivateKeyEncrypted] to check beforehand, or
+  /// you wait for the [ArgumentError] thrown by this method if the private
+  /// key is encrypted but no passphrase is provided.
   Future<void> start(
-    Uint8List pgpPublicKey,
-    Uint8List pgpPrivateKey, {
+    PgpProvider pgpProvider, {
     String? privateKeyPassphrase,
   }) async {
     // this can be considered to belong to the protocol
@@ -183,24 +183,15 @@ final class ProtocolManager {
       throw StateError("Bluetooth must be available at the start");
     }
 
-    final rawPrivateKey = PrivateKey(PacketList.decode(pgpPrivateKey));
-    if (rawPrivateKey.isEncrypted && privateKeyPassphrase == null) {
+    final pgpPublicKey = await Future.value(pgpProvider.getPublicKey());
+    if (privateKeyPassphrase == null &&
+        await Future.value(pgpProvider.isPrivateKeyEncrypted())) {
       throw ArgumentError.value(
-        pgpPrivateKey,
-        "pgpPrivateKey",
+        privateKeyPassphrase,
+        "privateKeyPassphrase",
         "Private key is encrypted; privateKeyPassphrase is required",
       );
     }
-    final privateKey = rawPrivateKey.isEncrypted
-        ? await _decryptPrivateKeyInIsolate(
-            rawPrivateKey,
-            privateKeyPassphrase!,
-          )
-        : rawPrivateKey;
-
-    // this can be considered to belong to the protocol
-    // ignore: invalid_use_of_protected_member
-    run.displayState.emit(run.displayState.withChanges(null, .tapOther, null));
 
     final rng = Random.secure();
     _nonceCounter = 0;
@@ -379,6 +370,10 @@ final class ProtocolManager {
     // BLE handshake has to carry exactly these values.
     NfcBootstrap? expectedPeer;
 
+    // this can be considered to belong to the protocol
+    // ignore: invalid_use_of_protected_member
+    run.displayState.emit(run.displayState.withChanges(null, .tapOther, null));
+
     try {
       Future<void> runtime() async {
         Future<void> reportUnreadable(
@@ -450,7 +445,7 @@ final class ProtocolManager {
 
             if (event is KeyExchangePayload) {
               pgpPublicKeyOther = await decrypt(event.publicPgpKey);
-              await executeForPagesOfContent(
+              await _executeForPagesOfContent(
                 await encrypt(pgpPublicKey),
                 (page, pageIndex, pageCount) => respond(
                   KeyExchangePayload(
@@ -486,9 +481,9 @@ final class ProtocolManager {
 
               late final Uint8List signature;
               try {
-                signature = await _signDetachedInIsolate(
-                  transcript,
-                  privateKey,
+                signature = await pgpProvider.signToDetached(
+                  utf8.encode(transcript),
+                  privateKeyPassphrase,
                 );
               } catch (e) {
                 showFailure(.suppliedKeysFailed, additionalInfo: e);
@@ -496,7 +491,7 @@ final class ProtocolManager {
                 return;
               }
 
-              await executeForPagesOfContent(
+              await _executeForPagesOfContent(
                 await encrypt(signature),
                 (page, pageIndex, pageCount) => respond(
                   SignatureExchangePayload(
@@ -912,7 +907,7 @@ final class ProtocolManager {
           );
 
           final keyExchangeRequestId = newRequestId();
-          await executeForPagesOfContent(
+          await _executeForPagesOfContent(
             await encrypt(pgpPublicKey),
             (page, pageIndex, pageCount) async =>
                 await run.bluetoothSenderState.send(
@@ -948,7 +943,10 @@ final class ProtocolManager {
           );
           final signature = await () async {
             try {
-              return await _signDetachedInIsolate(transcript, privateKey);
+              return await pgpProvider.signToDetached(
+                utf8.encode(transcript),
+                privateKeyPassphrase,
+              );
             } catch (e) {
               showFailure(.suppliedKeysFailed, additionalInfo: e);
               throw _ProtocolBreakException("Supplied signature failed");
@@ -956,7 +954,7 @@ final class ProtocolManager {
           }();
 
           final signatureExchangeRequestId = newRequestId();
-          await executeForPagesOfContent(
+          await _executeForPagesOfContent(
             await encrypt(signature),
             (page, pageIndex, pageCount) async =>
                 await run.bluetoothSenderState.send(
@@ -1436,7 +1434,7 @@ abstract base class BluetoothSenderState
   /// [receiveRequestIdResponse] call.
   @protected
   Future<void> notificationHandler(Uint8List data) async {
-    final entry = protocolStatesMultiPageHandler(_pageBuffer, data).entries;
+    final entry = _protocolStatesMultiPageHandler(_pageBuffer, data).entries;
     if (entry.isEmpty) return;
     if (!entry.first.value) {
       _armPageTimeout(entry.first.key);
@@ -1663,7 +1661,7 @@ abstract base class BluetoothReceiverState
     Object? central,
   }) async {
     if (_isForeignCentral(central)) return;
-    final entry = protocolStatesMultiPageHandler(_pageBuffer, data).entries;
+    final entry = _protocolStatesMultiPageHandler(_pageBuffer, data).entries;
     if (entry.isEmpty) return;
     if (!entry.first.value) {
       _armPageTimeout(entry.first.key, sendResponseWriteRequest);
@@ -1705,7 +1703,7 @@ final class BluetoothReceiverEvent extends Event<BluetoothReceiverState> {
 /// The returned map has the request ID of the page in [data] as the key, and a
 /// boolean indicating whether all pages for that request ID have been received
 /// as value.
-Map<int, bool> protocolStatesMultiPageHandler(
+Map<int, bool> _protocolStatesMultiPageHandler(
   Map<int, List<Payload?>> pageBuffer,
   Uint8List data,
 ) {
@@ -1739,7 +1737,7 @@ Map<int, bool> protocolStatesMultiPageHandler(
 /// The [content] is split into pages of size 500 bytes. The [callback] is
 /// called for each page with the page data, the 1-based page index, and the
 /// total page count.
-Future<void> executeForPagesOfContent(
+Future<void> _executeForPagesOfContent(
   Uint8List content,
   FutureOr<void> Function(Uint8List page, int pageIndex, int pageCount)
   callback,
@@ -1772,18 +1770,6 @@ bool _handshakeMatchesBootstrap(
 /// Checks if the given PGP private key is encrypted.
 bool isPrivateKeyEncrypted(Uint8List pgpPrivateKey) =>
     PrivateKey(PacketList.decode(pgpPrivateKey)).isEncrypted;
-
-Future<PrivateKey> _decryptPrivateKeyInIsolate(
-  PrivateKey key,
-  String passphrase,
-) => Isolate.run(() => key.decrypt(passphrase) as PrivateKey);
-
-Future<Uint8List> _signDetachedInIsolate(String transcript, PrivateKey key) =>
-    Isolate.run(
-      () => Uint8List.fromList(
-        OpenPGP.signDetachedCleartext(transcript, [key]).packetList.encode(),
-      ),
-    );
 
 PublicKeyPacket _primaryPublicKeyPacket(Uint8List framedPacketListBytes) =>
     PacketList.decode(framedPacketListBytes).packets
@@ -1850,7 +1836,7 @@ TranscriptVerification verifyTranscriptSignature(
 
   final message = Uint8List.fromList([
     ...signature.salt,
-    ...LiteralDataPacket.fromText(transcript).signBytes,
+    ...utf8.encode(transcript),
     ...signature.signatureData,
     signature.version,
     0xff,

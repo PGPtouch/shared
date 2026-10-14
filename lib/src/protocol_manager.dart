@@ -152,12 +152,28 @@ final class ProtocolManager {
   /// in the full framed OpenPGP packet-list format. If the private key backing
   /// [pgpProvider] is passphrase-encrypted, [privateKeyPassphrase] must be
   /// supplied to unlock it before it can be used for signing; it is passed
-  /// through to [PgpProvider.signToDetached] whenever a signature is needed.
+  /// through to [PgpProvider.tryDecryptPrivateKey] and
+  /// [PgpProvider.signToDetached] whenever needed.
   ///
   /// You may use [PgpProvider.isPrivateKeyEncrypted] to check beforehand, or
   /// you wait for the [ArgumentError] thrown by this method if the private
-  /// key is encrypted but no passphrase is provided.
+  /// key is encrypted but no passphrase is provided, or if the passphrase
+  /// fails to decrypt it.
+  ///
+  /// [pgpProvider] is destroyed (cf. [PgpProvider.destroy]) once this method
+  /// returns or throws, regardless of outcome.
   Future<void> start(
+    PgpProvider pgpProvider, {
+    String? privateKeyPassphrase,
+  }) async {
+    try {
+      await _start(pgpProvider, privateKeyPassphrase: privateKeyPassphrase);
+    } finally {
+      await Future.value(pgpProvider.destroy());
+    }
+  }
+
+  Future<void> _start(
     PgpProvider pgpProvider, {
     String? privateKeyPassphrase,
   }) async {
@@ -184,13 +200,24 @@ final class ProtocolManager {
     }
 
     final pgpPublicKey = await Future.value(pgpProvider.getPublicKey());
-    if (privateKeyPassphrase == null &&
-        await Future.value(pgpProvider.isPrivateKeyEncrypted())) {
-      throw ArgumentError.value(
-        privateKeyPassphrase,
-        "privateKeyPassphrase",
-        "Private key is encrypted; privateKeyPassphrase is required",
+    if (await Future.value(pgpProvider.isPrivateKeyEncrypted())) {
+      if (privateKeyPassphrase == null) {
+        throw ArgumentError.value(
+          privateKeyPassphrase,
+          "privateKeyPassphrase",
+          "Private key is encrypted; privateKeyPassphrase is required",
+        );
+      }
+      final decrypted = await Future.value(
+        pgpProvider.tryDecryptPrivateKey(privateKeyPassphrase),
       );
+      if (!decrypted) {
+        throw ArgumentError.value(
+          privateKeyPassphrase,
+          "privateKeyPassphrase",
+          "Private key could not be decrypted with the given passphrase",
+        );
+      }
     }
 
     final rng = Random.secure();

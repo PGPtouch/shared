@@ -5,17 +5,21 @@ import 'dart:typed_data';
 import 'package:dart_pg/dart_pg.dart' hide Uint8ListExt;
 import 'package:meta/meta.dart';
 
-import 'protocol_manager.dart';
+import '../shared.dart';
 
 abstract class PgpProvider {
   FutureOr<Uint8List> getPublicKey();
 
   FutureOr<bool> isPrivateKeyEncrypted();
 
+  FutureOr<bool> tryDecryptPrivateKey(String privateKeyPassphrase) => true;
+
   Future<Uint8List> signToDetached(
     Uint8List data,
     String? privateKeyPassphrase,
   );
+
+  FutureOr<void> destroy() {}
 
   @override
   @mustBeOverridden
@@ -25,6 +29,8 @@ abstract class PgpProvider {
 class LocalPgpProvider extends PgpProvider {
   final Uint8List _publicKey;
   final Uint8List _privateKey;
+
+  Uint8List? _decryptedPrivateKey;
 
   LocalPgpProvider(this._publicKey, this._privateKey);
 
@@ -36,11 +42,28 @@ class LocalPgpProvider extends PgpProvider {
       _isPrivateKeyEncryptedGlobal.call(_privateKey);
 
   @override
+  Future<bool> tryDecryptPrivateKey(String privateKeyPassphrase) async {
+    final rawPrivateKey = PrivateKey(PacketList.decode(_privateKey));
+    if (!rawPrivateKey.isEncrypted) return true;
+    try {
+      final decrypted = await Isolate.run(
+        () => rawPrivateKey.decrypt(privateKeyPassphrase) as PrivateKey,
+      );
+      _decryptedPrivateKey = Uint8List.fromList(decrypted.packetList.encode());
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  @override
   Future<Uint8List> signToDetached(
     Uint8List data,
     String? privateKeyPassphrase,
   ) async {
-    final rawPrivateKey = PrivateKey(PacketList.decode(_privateKey));
+    final rawPrivateKey = PrivateKey(
+      PacketList.decode(_decryptedPrivateKey ?? _privateKey),
+    );
     if (rawPrivateKey.isEncrypted && privateKeyPassphrase == null) {
       throw ArgumentError.value(
         _privateKey,
@@ -61,6 +84,13 @@ class LocalPgpProvider extends PgpProvider {
         ]).packetList.encode(),
       ),
     );
+  }
+
+  @override
+  FutureOr<void> destroy() {
+    _publicKey.destroy();
+    _privateKey.destroy();
+    _decryptedPrivateKey?.destroy();
   }
 
   @override

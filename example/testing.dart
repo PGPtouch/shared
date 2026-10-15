@@ -3,7 +3,6 @@ import 'dart:typed_data';
 
 import 'package:dart_pg/dart_pg.dart';
 import 'package:shared/shared.dart';
-import 'package:shared/src/user_id.dart';
 
 final class NfcSender extends NfcSenderState {
   /// Test-only pairing: a tap simulated in [start] is routed to this receiver.

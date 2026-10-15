@@ -8,6 +8,7 @@ export 'src/byte_package.dart';
 export 'src/packages.dart';
 export 'src/pgp_provider.dart';
 export 'src/protocol_manager.dart';
+export 'src/user_id.dart';
 
 extension RandomByte on Random {
   Uint8List nextByte(int length) {

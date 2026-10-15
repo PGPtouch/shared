@@ -14,7 +14,6 @@ import 'package:uuid/uuid.dart';
 
 import '../shared.dart';
 import 'common_state.dart';
-import 'user_id.dart';
 
 const bleCharacteristicRequest = "b92ab634-78c5-5407-95eb-b0c1c4c26d35";
 const bleCharacteristicResponse = "45f2cadc-dd84-5f49-9880-239d6328e79a";

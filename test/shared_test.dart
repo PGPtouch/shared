@@ -172,6 +172,22 @@ void signatureTests() {
       expect(result.userIds, contains('Test <test@example.com>'));
     });
 
+    test('rejects a key with a malformed user ID', () {
+      final badKey =
+          OpenPGP.generateKey(['not a valid user id'], 'pw') as PrivateKey;
+      final badPublicKey = Uint8List.fromList(
+        badKey.publicKey.packetList.encode(),
+      );
+      final signature = sign(transcript, DateTime.now(), badKey);
+      final result = verifyTranscriptSignature(
+        transcript,
+        badPublicKey,
+        signature,
+      );
+      expect(result.isVerified, isFalse);
+      expect(result.verificationError, contains('Invalid user ID format'));
+    });
+
     test('rejects a different transcript', () {
       final signature = sign('other', DateTime.now(), key);
       expect(

@@ -4,6 +4,8 @@ library;
 import 'dart:math';
 import 'dart:typed_data';
 
+export 'package:collection/collection.dart';
+
 export 'src/byte_package.dart';
 export 'src/packages.dart';
 export 'src/pgp_provider.dart';

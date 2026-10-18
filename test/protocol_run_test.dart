@@ -592,5 +592,246 @@ void protocolRunTests() {
         await b.manager.close();
       },
     );
+
+    test(
+      'a client whose provider fails to sign tells the server right away',
+      () async {
+        final (a, b) = createDevices(aCanSendNfc: false);
+
+        final serverRun = start(b, 'passphraseB');
+        await a.manager
+            .start(
+              _FaultyPgpProvider(
+                LocalPgpProvider(a.publicKey, a.privateKey),
+                onSign: () => throw StateError('hardware token removed'),
+              ),
+              privateKeyPassphrase: 'passphraseA',
+            )
+            .timeout(const Duration(seconds: 10));
+        await serverRun.timeout(const Duration(seconds: 10));
+
+        expect(a.events.last.result.value!.mode, DisplayMode.failure);
+        expect(
+          a.events.last.result.value!.failureMode,
+          DisplayFailureMode.suppliedKeysFailed,
+        );
+        expect(a.events.last.result.value!.additionalInfo, isA<StateError>());
+        expect(b.events.last.result.value!.mode, DisplayMode.error);
+        expect(
+          b.events.last.result.value!.errorMode,
+          DisplayErrorMode.unableToReadContent,
+        );
+
+        await a.manager.close();
+        await b.manager.close();
+      },
+    );
+
+    test(
+      'a server whose provider fails to sign tells the client right away',
+      () async {
+        final (a, b) = createDevices(aCanSendNfc: false);
+
+        final clientRun = start(a, 'passphraseA');
+        await b.manager
+            .start(
+              _FaultyPgpProvider(
+                LocalPgpProvider(b.publicKey, b.privateKey),
+                onSign: () => throw StateError('hardware token removed'),
+              ),
+              privateKeyPassphrase: 'passphraseB',
+            )
+            .timeout(const Duration(seconds: 10));
+        await clientRun.timeout(const Duration(seconds: 10));
+
+        expect(b.events.last.result.value!.mode, DisplayMode.failure);
+        expect(
+          b.events.last.result.value!.failureMode,
+          DisplayFailureMode.suppliedKeysFailed,
+        );
+        expect(a.events.last.result.value!.mode, DisplayMode.error);
+        expect(
+          a.events.last.result.value!.errorMode,
+          DisplayErrorMode.unableToReadContent,
+        );
+
+        await a.manager.close();
+        await b.manager.close();
+      },
+    );
+
+    test('an unusable signature from the provider is caught locally', () async {
+      final (a, b) = createDevices(aCanSendNfc: false);
+
+      final serverRun = start(b, 'passphraseB');
+      await a.manager
+          .start(
+            _FaultyPgpProvider(
+              LocalPgpProvider(a.publicKey, a.privateKey),
+              signatureOverride: Uint8List(0),
+            ),
+            privateKeyPassphrase: 'passphraseA',
+          )
+          .timeout(const Duration(seconds: 10));
+      await serverRun.timeout(const Duration(seconds: 10));
+
+      expect(
+        a.events.last.result.value!.failureMode,
+        DisplayFailureMode.suppliedKeysFailed,
+      );
+      expect(b.events.last.result.value!.mode, DisplayMode.error);
+
+      await a.manager.close();
+      await b.manager.close();
+    });
+
+    group('provider failures before the run', () {
+      final cases = <String, _FaultyPgpProvider Function(_Device)>{
+        'getPublicKey throws': (d) => _FaultyPgpProvider(
+          LocalPgpProvider(d.publicKey, d.privateKey),
+          onGetPublicKey: () => throw StateError('boom'),
+        ),
+        'getPublicKey returns garbage': (d) => _FaultyPgpProvider(
+          LocalPgpProvider(d.publicKey, d.privateKey),
+          publicKeyOverride: Uint8List.fromList([1, 2, 3]),
+        ),
+        'isPrivateKeyEncrypted throws': (d) => _FaultyPgpProvider(
+          LocalPgpProvider(d.publicKey, d.privateKey),
+          onIsEncrypted: () => throw StateError('boom'),
+        ),
+        'tryDecryptPrivateKey throws': (d) => _FaultyPgpProvider(
+          LocalPgpProvider(d.publicKey, d.privateKey),
+          onTryDecrypt: () => throw StateError('boom'),
+        ),
+      };
+
+      for (final entry in cases.entries) {
+        test('${entry.key}: the display ends in a failure', () async {
+          final (a, b) = createDevices();
+          final provider = entry.value(a);
+
+          await expectLater(
+            a.manager.start(provider, privateKeyPassphrase: 'passphraseA'),
+            throwsA(anything),
+          );
+
+          expect(a.events.last.contactMode.value, DisplayContactMode.done);
+          expect(a.events.last.result.value!.mode, DisplayMode.failure);
+          expect(
+            a.events.last.result.value!.failureMode,
+            DisplayFailureMode.suppliedKeysFailed,
+          );
+          expect(a.events.last.result.value!.additionalInfo, isNotNull);
+          expect(provider.destroyed, isTrue);
+
+          await a.manager.close();
+          await b.manager.close();
+        });
+      }
+    });
+
+    group('destroy', () {
+      test('does not mask the error that ended the run', () async {
+        final (a, b) = createDevices();
+        final provider = _FaultyPgpProvider(
+          LocalPgpProvider(a.publicKey, a.privateKey),
+          onGetPublicKey: () => throw StateError('original'),
+          onDestroy: () => throw StateError('destroy'),
+        );
+
+        await expectLater(
+          a.manager.start(provider, privateKeyPassphrase: 'passphraseA'),
+          throwsA(
+            isA<StateError>().having((e) => e.message, 'message', 'original'),
+          ),
+        );
+
+        await a.manager.close();
+        await b.manager.close();
+      });
+
+      test('is reported if the run itself succeeded', () async {
+        final (a, b) = createDevices();
+
+        await expectLater(
+          Future.wait([
+            a.manager.start(
+              _FaultyPgpProvider(
+                LocalPgpProvider(a.publicKey, a.privateKey),
+                onDestroy: () => throw StateError('destroy'),
+              ),
+              privateKeyPassphrase: 'passphraseA',
+            ),
+            start(b, 'passphraseB'),
+          ]).timeout(const Duration(seconds: 30)),
+          throwsA(isA<StateError>()),
+        );
+        expect(a.events.last.result.value!.mode, DisplayMode.success);
+
+        await a.manager.close();
+        await b.manager.close();
+      });
+    });
   });
+}
+
+class _FaultyPgpProvider extends PgpProvider {
+  final PgpProvider _inner;
+  final void Function()? onGetPublicKey;
+  final void Function()? onIsEncrypted;
+  final void Function()? onTryDecrypt;
+  final void Function()? onSign;
+  final void Function()? onDestroy;
+  final Uint8List? publicKeyOverride;
+  final Uint8List? signatureOverride;
+  bool destroyed = false;
+
+  _FaultyPgpProvider(
+    this._inner, {
+    this.onGetPublicKey,
+    this.onIsEncrypted,
+    this.onTryDecrypt,
+    this.onSign,
+    this.onDestroy,
+    this.publicKeyOverride,
+    this.signatureOverride,
+  });
+
+  @override
+  FutureOr<Uint8List> getPublicKey() {
+    onGetPublicKey?.call();
+    return publicKeyOverride ?? _inner.getPublicKey();
+  }
+
+  @override
+  FutureOr<bool> isPrivateKeyEncrypted() {
+    onIsEncrypted?.call();
+    return _inner.isPrivateKeyEncrypted();
+  }
+
+  @override
+  FutureOr<bool> tryDecryptPrivateKey(String privateKeyPassphrase) {
+    onTryDecrypt?.call();
+    return _inner.tryDecryptPrivateKey(privateKeyPassphrase);
+  }
+
+  @override
+  Future<Uint8List> signToDetached(
+    Uint8List data,
+    String? privateKeyPassphrase,
+  ) async {
+    onSign?.call();
+    return signatureOverride ??
+        await _inner.signToDetached(data, privateKeyPassphrase);
+  }
+
+  @override
+  FutureOr<void> destroy() {
+    destroyed = true;
+    onDestroy?.call();
+    return _inner.destroy();
+  }
+
+  @override
+  String toString() => '_FaultyPgpProvider';
 }

@@ -159,17 +159,27 @@ final class ProtocolManager {
   /// key is encrypted but no passphrase is provided, or if the passphrase
   /// fails to decrypt it.
   ///
+  /// Any [PgpProvider] method may throw. If this happens, the display state
+  /// ends with [DisplayFailureMode.suppliedKeysFailed] carrying the error, and
+  /// the error is rethrown if it occurred before the run began.
+  ///
   /// [pgpProvider] is destroyed (cf. [PgpProvider.destroy]) once this method
-  /// returns or throws, regardless of outcome.
+  /// returns or throws, regardless of outcome. An error thrown while
+  /// destroying never replaces an error that already ended the run, but is
+  /// thrown if the run itself succeeded.
   Future<void> start(
     PgpProvider pgpProvider, {
     String? privateKeyPassphrase,
   }) async {
     try {
       await _start(pgpProvider, privateKeyPassphrase: privateKeyPassphrase);
-    } finally {
-      await Future.value(pgpProvider.destroy());
+    } catch (_) {
+      try {
+        await Future.value(pgpProvider.destroy());
+      } catch (_) {}
+      rethrow;
     }
+    await Future.value(pgpProvider.destroy());
   }
 
   Future<void> _start(
@@ -198,8 +208,35 @@ final class ProtocolManager {
       throw StateError("Bluetooth must be available at the start");
     }
 
-    final pgpPublicKey = await Future.value(pgpProvider.getPublicKey());
-    if (await Future.value(pgpProvider.isPrivateKeyEncrypted())) {
+    Future<T> useProvider<T>(FutureOr<T> Function() call) async {
+      try {
+        return await Future.value(call.call());
+      } catch (e) {
+        // this can be considered to belong to the protocol
+        // ignore: invalid_use_of_protected_member
+        run.displayState.emit(
+          run.displayState.withChanges(
+            null,
+            .done,
+            DisplayResult(
+              mode: .failure,
+              errorMode: null,
+              failureMode: .suppliedKeysFailed,
+              additionalInfo: e,
+            ),
+          ),
+        );
+        rethrow;
+      }
+    }
+
+    final pgpPublicKey = await useProvider(() async {
+      final key = await Future.value(pgpProvider.getPublicKey());
+      _primaryPublicKeyPacket(key);
+      PublicKey(PacketList.decode(key));
+      return key;
+    });
+    if (await useProvider<bool>(() => pgpProvider.isPrivateKeyEncrypted())) {
       if (privateKeyPassphrase == null) {
         throw ArgumentError.value(
           privateKeyPassphrase,
@@ -207,8 +244,8 @@ final class ProtocolManager {
           "Private key is encrypted; privateKeyPassphrase is required",
         );
       }
-      final decrypted = await Future.value(
-        pgpProvider.tryDecryptPrivateKey(privateKeyPassphrase),
+      final decrypted = await useProvider<bool>(
+        () => pgpProvider.tryDecryptPrivateKey(privateKeyPassphrase),
       );
       if (!decrypted) {
         throw ArgumentError.value(
@@ -366,6 +403,31 @@ final class ProtocolManager {
           ),
         );
 
+    Future<Uint8List?> signTranscript(String transcript) async {
+      try {
+        final signature = await Future.value(
+          pgpProvider.signToDetached(
+            utf8.encode(transcript),
+            privateKeyPassphrase,
+          ),
+        );
+        final verification = verifyTranscriptSignature(
+          transcript,
+          pgpPublicKey,
+          signature,
+        );
+        if (!verification.isVerified) {
+          throw StateError(
+            "Supplied signature is invalid: ${verification.verificationError}",
+          );
+        }
+        return signature;
+      } catch (e) {
+        showFailure(.suppliedKeysFailed, additionalInfo: e);
+        return null;
+      }
+    }
+
     final roleDecided = Completer<ProtocolRole>()..future.ignore();
     final serverDone = Completer<void>()..future.ignore();
     var serverSignatureSent = false;
@@ -505,14 +567,9 @@ final class ProtocolManager {
                 uwb: null, // TODO: cf. 1.3, PGPtouch definition; UWB is not yet specified
               );
 
-              late final Uint8List signature;
-              try {
-                signature = await pgpProvider.signToDetached(
-                  utf8.encode(transcript),
-                  privateKeyPassphrase,
-                );
-              } catch (e) {
-                showFailure(.suppliedKeysFailed, additionalInfo: e);
+              final signature = await signTranscript(transcript);
+              if (signature == null) {
+                await reportUnreadable(data, respond);
                 abort("Supplied signature failed");
                 return;
               }
@@ -967,17 +1024,11 @@ final class ProtocolManager {
             capabilitiesB: Capabilities.fromMap(capabilities).toInt(),
             uwb: null, // TODO: cf. 1.3, PGPtouch definition; UWB is not yet specified
           );
-          final signature = await () async {
-            try {
-              return await pgpProvider.signToDetached(
-                utf8.encode(transcript),
-                privateKeyPassphrase,
-              );
-            } catch (e) {
-              showFailure(.suppliedKeysFailed, additionalInfo: e);
-              throw _ProtocolBreakException("Supplied signature failed");
-            }
-          }();
+          final signature = await signTranscript(transcript);
+          if (signature == null) {
+            await reportError(.error.unableToReadContent);
+            throw _ProtocolBreakException("Supplied signature failed");
+          }
 
           final signatureExchangeRequestId = newRequestId();
           await _executeForPagesOfContent(
@@ -1304,10 +1355,11 @@ enum DisplayFailureMode {
   /// connection.
   connectionFailed,
 
-  /// The signature on this device could not be generated correctly.
+  /// The supplied [PgpProvider] failed: it threw, or the key or signature it
+  /// supplied is unusable.
   ///
   /// If this is set, [DisplayResult.additionalInfo] contains the underlying
-  /// error thrown while signing.
+  /// error.
   suppliedKeysFailed,
 
   /// The verification of the signature of the other device failed.
@@ -1793,6 +1845,9 @@ bool _handshakeMatchesBootstrap(
     Capabilities.fromMap(handshake.capabilities).toInt() ==
         Capabilities.fromMap(bootstrap.capabilities).toInt();
 
+PublicKey publicKeyFromBytes(Uint8List framedPacketListBytes) =>
+    PublicKey(PacketList.decode(framedPacketListBytes));
+
 /// Checks if the given PGP private key is encrypted.
 bool isPrivateKeyEncrypted(Uint8List pgpPrivateKey) =>
     PrivateKey(PacketList.decode(pgpPrivateKey)).isEncrypted;
@@ -1801,6 +1856,40 @@ PublicKeyPacket _primaryPublicKeyPacket(Uint8List framedPacketListBytes) =>
     PacketList.decode(framedPacketListBytes).packets
         .whereType<PublicKeyPacket>()
         .first;
+
+/// Whether the two framed public key packets describe the same OpenPGP key.
+///
+/// For this, both fingerprints of the primary public key packets must match,
+/// and at least one of their user IDs refers to an equivalent email address
+/// (see [UserId.isEmailEquivalent]).
+///
+/// Certifications, names, comments, other user IDs and subkeys are deliberately
+/// ignored, since two copies of the same key can differ in those (e.g. after a
+/// key update). Returns `false` if either input contains no primary public key
+/// packet or cannot be decoded.
+bool publicKeysMatch(Uint8List a, Uint8List b) {
+  try {
+    if (!const ListEquality<int>().equals(
+      _primaryPublicKeyPacket(a).fingerprint,
+      _primaryPublicKeyPacket(b).fingerprint,
+    )) {
+      return false;
+    }
+    List<UserId> userIdsOf(Uint8List bytes) =>
+        PublicKey(PacketList.decode(bytes)).users
+            .map((user) => UserId.tryParse(user.userID))
+            .nonNulls
+            .toList();
+    final userIdsB = userIdsOf(b);
+    return userIdsOf(a).any((idA) => userIdsB.any(idA.isEmailEquivalent));
+    // dart_pg signals failures with Errors
+    // ignore: avoid_catching_errors
+  } on Error catch (_) {
+    return false;
+  } on Exception catch (_) {
+    return false;
+  }
+}
 
 typedef TranscriptVerification = ({
   bool isVerified,

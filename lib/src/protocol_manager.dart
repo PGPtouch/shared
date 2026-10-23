@@ -128,6 +128,7 @@ final class _EventQueue<T> {
 final class ProtocolManager {
   final ProtocolRun run;
   int _nonceCounter = 0;
+  bool _finished = false;
 
   ProtocolManager({
     required NfcSenderState nfcSenderState,
@@ -143,7 +144,10 @@ final class ProtocolManager {
        );
 
   /// Closes the protocol manager and releases any associated resources.
-  Future<void> close() async => await run.close();
+  Future<void> close() async {
+    _finished = true;
+    await run.close();
+  }
 
   /// Starts the protocol manager using the given [pgpProvider].
   ///
@@ -367,7 +371,6 @@ final class ProtocolManager {
       aesGcm = AesGcm.with256bits();
     }
 
-    var finished = false;
     ProtocolRole? claimedRole;
     bool claimRole(ProtocolRole candidate) {
       claimedRole ??= candidate;
@@ -379,7 +382,7 @@ final class ProtocolManager {
       DisplayContactMode contactMode,
       DisplayResult? result,
     ) {
-      if (finished) return;
+      if (_finished) return;
       // this can be considered to belong to the protocol
       // ignore: invalid_use_of_protected_member
       run.displayState.emit(
@@ -526,7 +529,7 @@ final class ProtocolManager {
           Future<void> Function(Uint8List) respond,
           Object? central,
         ) async {
-          if (finished || serverDone.isCompleted) return;
+          if (_finished || serverDone.isCompleted) return;
           try {
             final event = await readIncoming(data, respond);
             if (event == null) return;
@@ -635,7 +638,7 @@ final class ProtocolManager {
           Future<void> Function(Uint8List) respond,
           Object? central,
         ) async {
-          if (finished || claimedRole != null) return;
+          if (_finished || claimedRole != null) return;
           Uint8List? requestId;
           Future<void> reject(PayloadType code) async {
             final id = requestId;
@@ -731,7 +734,7 @@ final class ProtocolManager {
                 // just exit the loop if the events stream is closed
                 // ignore: avoid_catching_errors
               } on StateError {
-                if (roleDecided.isCompleted || finished) return;
+                if (roleDecided.isCompleted || _finished) return;
                 throw _ProtocolBreakException(
                   "NFC negotiation failed due to closed events stream.",
                 );
@@ -861,7 +864,7 @@ final class ProtocolManager {
           onHandshakeRequest,
         );
         run.bluetoothReceiverState._registerConnectionLossHandler((reason) {
-          if (finished ||
+          if (_finished ||
               claimedRole != ProtocolRole.serverSender ||
               serverDone.isCompleted ||
               serverSignatureSent) {
@@ -900,7 +903,7 @@ final class ProtocolManager {
           await run.bluetoothReceiverState.dispose();
 
           void ensureActive() {
-            if (finished) {
+            if (_finished) {
               throw _ProtocolBreakException("Protocol run already finished.");
             }
           }
@@ -1103,7 +1106,7 @@ final class ProtocolManager {
       // error is handed to the app through DisplayResult.additionalInfo.
       showFailure(.connectionFailed, additionalInfo: e);
     } finally {
-      finished = true;
+      _finished = true;
       run.bluetoothReceiverState._unregisterReadRequestHandler();
       run.bluetoothReceiverState._unregisterConnectionLossHandler();
       await nfcEvents.cancel();

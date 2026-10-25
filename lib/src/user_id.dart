@@ -176,7 +176,7 @@ class UserId {
 
   static const Duration defaultRequestTimeout = Duration(seconds: 10);
 
-  Future<UserIdKeyFetchResult> fetchKeyFromPublic(
+  Future<UserIdKeyFetchResult?> fetchKeyFromPublic(
     HttpClientProvider client, {
     List<Uint8List>? fingerprints,
     List<HkpKeyServer> hkpKeyServers = defaultHkpKeyServers,
@@ -199,7 +199,7 @@ class UserId {
         );
       }
     }
-    return (keys: <UserIdKeyFetchKey>[], origin: null, originHost: null);
+    return null;
   }
 
   Future<List<UserIdKeyFetchResult>> fetchKeyFromPublicFull(
